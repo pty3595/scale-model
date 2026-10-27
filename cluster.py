@@ -187,10 +187,12 @@ def calibration():
     cal["cluster"] = NAME
     cal["clients"] = [{"host": c["host"], "mgmt": c["addr"], "runtime": True, "python": c["python"], "workdir": c["workdir"]} for c in CLIENTS]
     cal["storage_nodes"] = len(STORAGE)
-    for k, v in (("disk_read", m["disk_read_gibps"]), ("disk_write", m["disk_write_gibps"]), ("link", m["link_gibps"])):
-        cal["ceilings_gibps"][d[k]] = dict(cal["ceilings_gibps"][d[k]], value=v)
+    for k in ("disk_read", "disk_write", "link"):          # 천장은 사용률(%)에만 쓴다. 없으면 None — 사용률이 빈다
+        cal["ceilings_gibps"][d[k]] = dict(cal["ceilings_gibps"][d[k]], value=m.get(f"{k}_gibps"))
+    tfs = DIR / f"{PATH.stem}-ceiling.json"                       # 3FS 경로 천장(ceiling.py 가 잰다)
+    cal["threefs_ceiling"] = json.loads(tfs.read_text()) if tfs.exists() else None
     cal["replicas"] = dict(cal["replicas"], value=m["replicas"])
-    # 클라이언트 한 대 한계(plan.py 가 넘는 단계를 빼고 "max" 를 정한다). 그 클러스터에서 잰 값이 없으면 자르지 않는다
+    # 클라이언트 한 대 한계(plan.py 가 넘는 배속을 빼고 "max" 를 정한다). 그 클러스터에서 잰 값이 없으면 자르지 않는다
     cal["client_wall"] = dict(cal["client_wall"], paced_gibps=m.get("client_load_wall_gibps"))
     cal["store_wall"] = dict(cal["store_wall"], overlap_gibps=m.get("client_store_wall_gibps"))
     cal["layout"] = dict(cal["layout"], chains=m["chains"], default_stripe=m["default_stripe"], chunk_bytes=m["chunk_bytes"])
@@ -272,8 +274,13 @@ def check():
         except Exception as e:
             ok(f"{h}", False, str(e)[:200])
     ok("FUSE 템플릿 사본", fuse_template().exists(), str(fuse_template()))
+    # 천장은 돌리는 데 필요 없다(참고 값). 없으면 알리기만 한다
     blank = [k for k in ("disk_read_gibps", "disk_write_gibps", "link_gibps") if not C["measured"].get(k)]
-    ok("천장", not blank, "빈칸 " + ", ".join(blank) if blank else "")
+    print("  -- 디스크 · 링크 천장 " + (f"없음({', '.join(blank)}) — 사용률(%)이 빈다" if blank else "있음"))
+    tfs = DIR / f"{PATH.stem}-ceiling.json"
+    t = json.loads(tfs.read_text()) if tfs.exists() else None
+    print("  -- 3FS 경로 천장 " + (f"읽기 {t['read_gibps']:.2f} · 쓰기 {t['write_gibps']:.2f} GiB/s ({t['measured_at']})" if t
+                                  else "없음 — python3 ceiling.py 로 잰다"))
     print("통과" if not bad else f"안 된 것 {len(bad)}: " + ", ".join(bad))
     return not bad
 
@@ -380,12 +387,12 @@ def discover(name):
         p = cp.get(h) or probe(h)
         L += ["[[storage]]", f"host = {q(h)}", f"addr = {q(res(h))}", f"node_id = {nid}",
               f"netdevs = {q(p['nd'])}   # 확인(IPv4 있는 것: {', '.join(p['ip4']) or '없음'})", f"nvme = {q(p['nv'])}   # 확인 — 3FS target 이 든 것만", ""]
-    L += ["[measured]   # 천장은 사양값으로 시작해도 된다(그때는 그렇게 적는다). 3FS 구성은 admin_cli 에서",
-          'disk_read_gibps = ""', 'disk_write_gibps = ""', 'link_gibps = ""   # 노드 하나의 RDMA 선로 합(GiB/s)',
+    L += ["[measured]   # 3FS 구성은 admin_cli 에서. 천장(선택, 사용률 %에만 쓴다)은 사양값이어도 된다 — 그때는 그렇게 적는다",
+          '# disk_read_gibps = ""', '# disk_write_gibps = ""', '# link_gibps = ""   # 노드 하나의 RDMA 선로 합(GiB/s)',
           f"replicas = {max((len(re.findall(r'\d+\([A-Z-]+\)', c)) for c in chains), default=0) or q('')}   # 확인 — list-chains",
           f"chains = {len(chains) or q('')}", f"default_stripe = {lay.get('Layout-StripeSize') or q('')}", f"chunk_bytes = {lay.get('Layout-ChunkSize') or q('')}"]
     out.write_text("\n".join(L) + "\n")
-    print(f"초안 {out}, FUSE 템플릿 {fuse}. 빈칸 · '# 확인' 을 채운 뒤 cluster.py check")
+    print(f"초안 {out}, FUSE 템플릿 {fuse}. 빈칸 · '# 확인' 을 채운 뒤 cluster.py check, 3FS 경로 천장은 ceiling.py")
 
 
 if __name__ == "__main__":

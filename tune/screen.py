@@ -2,15 +2,15 @@
 """설정 후보 거르기 — 기준 상황(hf3fs x coder x Qwen3-14B, store 16 · 폴더 16, FUSE 기본값)에서 아직 안 잰 후보를
 IO 경로 층마다(동시성 · 크기 · 배치) 하나씩 바꿔, 결과를 바꾸는 것만 남긴다 (10-20 사용자 요청, 09:00 전에 끝내고 되돌린다).
 
-  거르기: 기준의 최대 단계 L 에서 한 번. 통과면 L 위 한 단계 — 통과하면(기준보다 낫다) 계속 올려 최대를 찾는다.
-          L 에서 실패면(기준보다 나쁘다) 한 단계 아래 한 번
+  거르기: 기준의 최대 배속 L 에서 한 번. 통과면 L 위 한 칸(배속 15%) — 통과하면(기준보다 낫다) 계속 올려 최대를 찾는다.
+          L 에서 실패면(기준보다 나쁘다) 한 칸 아래 한 번
   후보에서 뺀 것(코드로 확인): hf3fs io_depth · ior_entries · iov_size — worker 하나가 key 를 IO 한 번(prep · submit · wait 1)으로 읽고 쓰며,
           key(40-80 MiB)가 iov(200 MB) 안에 든다. FUSE 쓰기 admission — CONFIG_ITEM 이라 FUSE 를 다시 띄워야 한다(10-19)
   storage RDMA 동시 수: 사용자 허락(10-20 "크게 문제 없으면 껴서"). hot-update, 메모리에서만, 끝에 256 으로 되돌리고 네 대 확인
 
-    screen.py [마감 HH:MM, 기본 08:30] [--model M] [--folders 16|1] [--cands a,b] [--repeat 0.40,0.45 --times 2]
+    screen.py [마감 HH:MM, 기본 08:30] [--model M] [--folders 16|1] [--cands a,b] [--repeat 2.64,3.03 --times 2]
       --model · --folders: 다른 상황(그 모델의 matrix 결과에서 가장 좋았던 adapter 설정)에서 거른다
-      --repeat: 거르기 대신 기준 설정을 그 단계들에서 --times 번 더 돌린다(같은 설정의 흔들림)
+      --repeat: 거르기 대신 기준 설정을 그 배속들에서 --times 번 더 돌린다(같은 설정의 흔들림)
 """
 import argparse
 import json
@@ -112,17 +112,17 @@ class Screen(T.Sweep):
         self.res = json.loads(self.res_path.read_text()) if self.res_path.exists() else {}
         self.deadline = deadline
 
-    def measure(self, tag, c, d, level):
+    def measure(self, tag, c, d, speed):
         if time.time() + RUN_S > self.deadline:
             raise TimeoutError
-        return super().measure(tag, c, d, level)
+        return super().measure(tag, c, d, speed)
 
     def ok3(self, tag, c, d, lv, first):
-        """lv 에서 두 번 더 돌린 세 번 중 통과 수. 한 번짜리는 경계에서 한 단계씩 흔들린다(10-21 다시 돌리기)"""
+        """lv 에서 두 번 더 돌린 세 번 중 통과 수. 한 번짜리는 경계에서 한 칸씩 흔들린다(10-21 다시 돌리기)"""
         return int(first["ok"]) + sum(int(self.measure(f"{tag}.r{k}", c, d, lv)["ok"]) for k in (2, 3))
 
     def screen(self, tag, c, d, base_lv):
-        """base_lv 에서 한 번. 한 단계 차이는 그 단계를 두 번 더 돌려 세 번 중 두 번으로 정한다. 두 단계 넘는 차이는 한 번으로 믿는다"""
+        """base_lv 에서 한 번. 한 칸 차이는 그 칸을 두 번 더 돌려 세 번 중 두 번으로 정한다. 두 칸 넘는 차이는 한 번으로 믿는다"""
         i = GRID.index(base_lv)
         m = self.measure(tag, c, d, GRID[i])
         if m["ok"]:
@@ -137,18 +137,18 @@ class Screen(T.Sweep):
                 verdict = "기준과 같다"
             elif GRID.index(best) - GRID.index(base_lv) == 1:
                 n = self.ok3(tag, c, d, best, top)
-                verdict = f"낫다 ({base_lv:.2f} → {best:.2f}, 세 번 중 {n})" if n >= 2 else f"기준과 같다 ({best:.2f} 세 번 중 {n} — 흔들림)"
+                verdict = f"낫다 (x{base_lv:g} → x{best:g}, 세 번 중 {n})" if n >= 2 else f"기준과 같다 (x{best:g} 세 번 중 {n} — 흔들림)"
                 best = best if n >= 2 else base_lv
             else:
-                verdict = f"낫다 ({base_lv:.2f} → {best:.2f})"
+                verdict = f"낫다 (x{base_lv:g} → x{best:g})"
         else:
             n = self.ok3(tag, c, d, base_lv, m)
             if n >= 2:
-                best, verdict = base_lv, f"기준과 같다 ({base_lv:.2f} 세 번 중 {n})"
+                best, verdict = base_lv, f"기준과 같다 (x{base_lv:g} 세 번 중 {n})"
             else:
                 m = self.measure(tag, c, d, GRID[i - 1])
                 best = GRID[i - 1] if m["ok"] else None
-                verdict = f"나쁘다 ({base_lv:.2f} 세 번 중 {n}" + (f", {best:.2f} 통과)" if best else f", {GRID[i - 1]:.2f} 도 실패)")
+                verdict = f"나쁘다 (x{base_lv:g} 세 번 중 {n}" + (f", x{best:g} 통과)" if best else f", x{GRID[i - 1]:g} 도 실패)")
         S.log(f"   {tag} 거르기: {verdict}")
         return best, verdict
 
@@ -160,10 +160,10 @@ def main():
     ap.add_argument("--folders", type=int, default=16, choices=[1, 16])
     ap.add_argument("--trace", default="coder", choices=list(T.WORKLOADS))
     ap.add_argument("--cands", help="후보 이름 (기본: 전부)")
-    ap.add_argument("--repeat", help="기준 설정을 다시 돌릴 단계들")
+    ap.add_argument("--repeat", help="기준 설정을 다시 돌릴 배속들")
     ap.add_argument("--times", type=int, default=2)
     ap.add_argument("--rep-start", type=int, default=1, help="다시 돌리기 tag 의 첫 번호(rep{N}-) — 앞서 쓴 번호와 겹치지 않게")
-    ap.add_argument("--base-lv", type=float, help="기준의 최대 단계(다시 돌리기로 확인한 값). 기본: tune 결과의 최대")
+    ap.add_argument("--base-lv", type=float, help="기준의 최대 배속(다시 돌리기로 확인한 값). 기본: tune 결과의 최대")
     args = ap.parse_args()
     hm, nd = args.hm, args.folders
     now = time.localtime()
@@ -174,10 +174,12 @@ def main():
         signal.signal(s, lambda *_: sys.exit(1))
     sc = Screen(dl, args.model, nd, args.trace)
     ok = [float(k) for k, m in sc.ref.items() if m["ok"]]
-    base_lv = args.base_lv or (max(ok) if ok else 0.35)
+    base_lv = T.on_grid(args.base_lv) if args.base_lv else max(ok, default=None)
+    if base_lv is None:
+        raise SystemExit(f"기준의 최대 배속을 모른다 — tune.py sweep a --knobs s16-d{nd} 를 먼저 돌리거나 --base-lv 를 준다")
     # --cands 에 base 를 넣으면 기준 설정도 같은 호출에서 돈다(같은 때 · 미리 쓴 chunk 를 같이 쓴다, 10-23 주말)
     cands = [c for c in [("base", {})] + CANDS if (args.cands and c[0] in args.cands.split(",")) or (not args.cands and c[0] != "base")]
-    S.log(f"== {'다시 돌리기' if args.repeat else '거르기'} ({args.model}, store 16 · 폴더 {nd}, 기준 최대 단계 {base_lv:.2f}, 마감 {hm})")
+    S.log(f"== {'다시 돌리기' if args.repeat else '거르기'} ({args.model}, store 16 · 폴더 {nd}, 기준 최대 배속 x{base_lv:g}, 마감 {hm})")
     summary = {}
     bad = S.check_home()
     if bad:
@@ -191,10 +193,10 @@ def main():
                 set_st(**{**ST_DEFAULT, **v.get("st", {})})
                 set_cr(v.get("cr", CR_DEFAULT))
                 S.apply({**S.BASE, **v.get("fuse", {})})
-                for lv in (float(x) for x in args.repeat.split(",")):
+                for lv in (T.on_grid(float(x)) for x in args.repeat.split(",")):
                     for k in range(args.rep_start, args.rep_start + args.times):
                         m = sc.measure(f"rep{k}-{name}", knob(v, v.get("nd", nd)), data_dir(v.get("stripe", T.STRIPE), v.get("nd", nd), sc.wm), lv)
-                        summary.setdefault(f"{name} {lv:.2f}", []).append(m["ok"])
+                        summary.setdefault(f"{name} x{lv:g}", []).append(m["ok"])
             S.log(f"   다시 돌리기: {summary}")
         for name, v in ([] if args.repeat else cands):
             why = skip(v)

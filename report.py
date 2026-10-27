@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """replay 결과를 읽는다 — sweep 곡선, 대상 클러스터의 운영점, 두 실행(최적화 전·후)의 비교.
 
-  곡선     단계마다 사용률(storage 디스크 읽기·쓰기, 클라이언트·storage 링크)과 request 당 load 시간,
+  곡선     배속마다 사용률(storage 디스크 읽기·쓰기, 클라이언트·storage 링크 — 천장을 적었을 때)과 request 당 load 시간,
            request 시작 지연, storage NIC drop 을 표로 낸다
-  운영점   --target 사양에서 대상 storage 노드의 디스크 읽기 사용률을 구해 곡선 위의 위치와 그 자리의 값을 보인다.
+  운영점   (천장이 있어야 한다) --target 사양에서 대상 storage 노드의 디스크 읽기 사용률을 구해 곡선 위의 위치와 그 자리의 값을 보인다.
            대상의 클라이언트 링크 사용률 ÷ 디스크 읽기 사용률이 우리와 크게 다르면(먼저 차는 자원이 다르면) 경고한다
-  비교     --baseline 의 같은 단계와 request 끼리 짝지어 load 시간 비율(중앙값, 95% 구간)을 낸다.
+  비교     --baseline 의 같은 배속과 request 끼리 짝지어 load 시간 비율(중앙값, 95% 구간)을 낸다.
            --noise 에 기준을 한 번 더 돌린 결과를 주면 그 차이를 잡음으로 보고, 효과가 잡음 밖인지 판정한다
 
     python3 report.py results/coder
@@ -27,13 +27,13 @@ def pct(xs, q):
     return xs[min(len(xs) - 1, int(q * len(xs)))]
 
 
-def levels(run: Path) -> dict:
-    """단계 이름 → summary. 폴더 하나짜리 실행도 받는다."""
+def runs(run: Path) -> dict:
+    """실행 이름 → summary, 배속 순. 폴더 하나짜리 실행도 받는다."""
     if (run / "summary.json").exists():
         return {run.name: json.loads((run / "summary.json").read_text())}
     out = {d.name: json.loads((d / "summary.json").read_text())
            for d in run.iterdir() if (d / "summary.json").exists()}
-    return dict(sorted(out.items(), key=lambda kv: kv[1]["util"]["disk_read"]))
+    return dict(sorted(out.items(), key=lambda kv: kv[1]["speed"]))
 
 
 def drops(s: dict) -> int:
@@ -42,11 +42,13 @@ def drops(s: dict) -> int:
 
 
 def curve(lv: dict) -> None:
-    print(f"{'단계':>9}  {'디스크 읽기':>6} {'쓰기':>6}  {'링크 클라':>6} {'storage':>7}  "
+    print(f"{'실행':>9}  {'배속':>6}  {'디스크 읽기 GiB/s':>8}  {'사용률 읽기':>6} {'쓰기':>6}  {'링크 클라':>6} {'storage':>7}  "
           f"{'load p50':>8} {'p99':>6}  {'시작 지연 p99':>8}  {'NIC drop':>9}")
     for name, s in lv.items():
-        u, l = s["util"], s["load_s_per_request"]
-        print(f"{name:>9}  {u['disk_read']:9.3f} {u['disk_write']:6.3f}  {u['client_link']:8.3f} {u['storage_link']:7.3f}  "
+        u, l = s["util"] or {}, s["load_s_per_request"]
+        f = lambda k, w: f"{u[k]:{w}.3f}" if k in u else f"{'-':>{w}}"
+        print(f"{name:>9}  x{s['speed']:<5.3g}  {s['disk_gibps']['read']:16.2f}  {f('disk_read', 9)} {f('disk_write', 6)}  "
+              f"{f('client_link', 8)} {f('storage_link', 7)}  "
               f"{l['p50']:7.2f}s {l['p99']:5.2f}s  {s['late_s']['p99']:11.2f}s  {drops(s):9d}")
 
 
@@ -77,7 +79,7 @@ def target_point(t: dict) -> dict:
 
 
 def at(lv: dict, x: float, get) -> float | None:
-    """곡선에서 디스크 읽기 사용률 x 자리의 값 (이웃 두 단계 사이 직선). 범위 밖이면 None."""
+    """곡선에서 디스크 읽기 사용률 x 자리의 값 (이웃 두 배속 사이 직선). 범위 밖이면 None."""
     pts = sorted((s["util"]["disk_read"], get(s)) for s in lv.values())
     for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
         if x0 <= x <= x1:
@@ -133,7 +135,7 @@ def run_dir(run: Path, name: str) -> Path:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("run", help="replay.py --out 폴더 (sweep 이면 단계별 폴더를 담은 것)")
+    ap.add_argument("run", help="replay.py --out 폴더 (sweep 이면 배속별 폴더를 담은 것)")
     ap.add_argument("--target", help="대상 클러스터 사양 JSON")
     ap.add_argument("--baseline", help="비교할 기준 실행 (같은 plan)")
     ap.add_argument("--noise", help="기준을 한 번 더 돌린 실행 — 기준과의 차이를 잡음으로 본다")
@@ -141,11 +143,13 @@ def main():
     args = ap.parse_args()
 
     run = Path(args.run)
-    lv = levels(run)
+    lv = runs(run)
     curve(lv)
-    res = {"levels": {k: {"util": s["util"], "load_s_per_request": s["load_s_per_request"], "late_s": s["late_s"],
+    res = {"runs": {k: {"speed": s["speed"], "util": s["util"], "load_s_per_request": s["load_s_per_request"], "late_s": s["late_s"],
                           "nic_drops": drops(s)} for k, s in lv.items()}}
     if args.target:
+        if any(s["util"] is None for s in lv.values()):
+            raise SystemExit("--target 은 사용률 곡선 위에 찍는다 — 천장(clusters/<이름>.toml [measured] disk_read_gibps 등)을 적고 돌린 실행이어야 한다")
         t = json.loads(Path(args.target).read_text())
         show_target(lv, t)
         res["target"] = target_point(t)

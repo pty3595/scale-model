@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""공개 trace 한 구간을 클라이언트별 replay plan 으로 바꾼다. 부하를 여러 단계로 나눠 sweep 한다.
+"""공개 trace 한 구간을 클라이언트별 replay plan 으로 바꾼다. replay 배속을 여러 개로 sweep 한다.
 
 1. 캐시 시뮬레이터(cache_sim.py)로 trace 구간을 한 번 계산한다 — request 마다 3FS 에서 load·store 할 chunk.
    클라이언트 하나 = 인스턴스(LMCache MP 서버) 하나로, GPU prefix cache 와 L1 은 따로, 3FS 는 공유한다.
    request 는 L1 에 prefix 가 가장 길게 있는 클라이언트로 보낸다(비기면 지금까지 받은 chunk 가 가장 적은 곳).
    구간 앞의 request 도 캐시 상태를 만들기 위해 계산하되 event 는 구간 안만 낸다
-2. 1배속일 때의 3FS load 양으로, 단계마다 storage 디스크 읽기 사용률이 목표값이 되는 배속을 정한다.
-   replay 시각 = (trace 시각 - 구간 시작) / 배속. 캐시 계산은 배속과 무관하므로 한 번만 한다
-3. 가장 바쁜 클라이언트의 load·store 가 이 클러스터의 클라이언트 한계(calibration.json)를 넘는 단계는 빼고,
+2. 배속마다 plan 을 낸다. replay 시각 = (trace 시각 - 구간 시작) / 배속. 캐시 계산은 배속과 무관하므로 한 번만 한다.
+   천장(clusters/<이름>.toml [measured])을 적어 두면 그 배속에서 예상되는 사용률도 붙인다
+3. 가장 바쁜 클라이언트의 load·store 가 이 클러스터의 클라이언트 한계(calibration.json)를 넘는 배속은 빼고,
    max 는 그 한계까지의 배속이다. routing 이 prefix 를 따라가서 클라이언트마다 양이 다르다
 
 event 하나 = request 하나: [replay 시각(초), lookup 할 key 들, load 할 key 들, store 묶음들]
@@ -17,7 +17,7 @@ event 하나 = request 하나: [replay 시각(초), lookup 할 key 들, load 할
 구간 안에서 3FS lookup 이 찾아야 하는데 구간 전에 저장됐어야 할 chunk 는 prepopulate 로 따로 낸다 (replay 전에 써 둔다).
 
     python3 plan.py alibaba-coder --out plans/coder
-    python3 plan.py alibaba-coder --levels 0.05,0.1,max --serving-cfg targets/<서빙 설정>.json --out plans/coder-big-l1
+    python3 plan.py alibaba-coder --speeds 1,4,max --serving-cfg targets/<서빙 설정>.json --out plans/coder-big-l1
 """
 
 import argparse
@@ -116,7 +116,7 @@ def simulate(trace: str, start_min: float, minutes: float, clients: int, cfg: di
 
 
 def at_speed(base: dict, speed: float, cal: dict) -> dict:
-    """1배속 plan 을 배속 speed 로 옮기고, 이 클러스터에서 예상되는 사용률을 붙인다."""
+    """1배속 plan 을 배속 speed 로 옮기고, 이 클러스터에서 예상되는 사용률을 붙인다(천장이 없으면 None)."""
     plan = copy.deepcopy(base)
     replay_s = (base["window_min"][1] - base["window_min"][0]) * 60 / speed
     gib = base["chunk_bytes"] / GIB
@@ -131,7 +131,7 @@ def at_speed(base: dict, speed: float, cal: dict) -> dict:
     plan.update({
         "speed": speed, "replay_s": replay_s, "load_gibps": load, "store_gibps": store, "client_gibps": per_client,
         "util_ceilings_gibps": ceil,
-        "util": util_of(load, store, ceil, rep, nodes, n),
+        "util": util_of(load, store, ceil, rep, nodes, n) if all(ceil.values()) else None,
     })
     return plan
 
@@ -151,8 +151,8 @@ def util_ceilings(cal: dict) -> dict:
     return {k: cal["ceilings_gibps"][d[k]]["value"] for k in ("disk_read", "disk_write", "link")}
 
 
-def sweep(base: dict, cal: dict, levels: list[str]) -> list[dict]:
-    """디스크 읽기 사용률 단계마다 plan. 클라이언트 한계를 넘는 단계는 이유와 함께 뺀다."""
+def sweep(base: dict, cal: dict, speeds: list[str]) -> list[dict]:
+    """배속마다 plan. 클라이언트 한계를 넘는 배속은 이유와 함께 뺀다. max 는 그 한계까지의 배속"""
     one = at_speed(base, 1.0, cal)
     if one["load_gibps"] <= 0:
         raise SystemExit("이 구간은 3FS load 가 없다. 다른 구간을 고른다.")
@@ -161,35 +161,36 @@ def sweep(base: dict, cal: dict, levels: list[str]) -> list[dict]:
     ld1, st1 = max(one["client_gibps"]["load"]), max(one["client_gibps"]["store"])   # 가장 바쁜 클라이언트, 1배속
     max_speed = min(load_wall / ld1, store_wall / st1 if st1 else inf)
     out = []
-    for lv in levels:
-        if lv == "max":
+    for sp in speeds:
+        name = sp if sp == "max" else f"x{float(sp):g}"
+        if sp == "max":
             if max_speed == inf:
-                out.append({"level": lv, "skipped": "클라이언트 한계를 모른다 — [measured] client_load_wall_gibps · client_store_wall_gibps 나 --load-wall · --store-wall"})
+                out.append({"name": name, "skipped": "클라이언트 한계를 모른다 — [measured] client_load_wall_gibps · client_store_wall_gibps 나 --load-wall · --store-wall"})
                 continue
             speed = max_speed
         else:
-            speed = float(lv) * util_ceilings(cal)["disk_read"] / one["load_gibps"]
+            speed = float(sp)
             if speed > max_speed * 1.0001:
                 need = []
                 if ld1 * speed > load_wall:
                     need.append(f"가장 바쁜 클라이언트 load {ld1 * speed:.2f} > {load_wall} GiB/s")
                 if st1 * speed > store_wall:
                     need.append(f"가장 바쁜 클라이언트 store {st1 * speed:.2f} > {store_wall} GiB/s")
-                out.append({"level": lv, "skipped": ", ".join(need)})
+                out.append({"name": name, "skipped": ", ".join(need)})
                 continue
         plan = at_speed(base, speed, cal)
-        plan["level"] = lv
+        plan["name"] = name
         out.append(plan)
     return out
 
 
 def describe(plan: dict) -> str:
     u = plan["util"]
-    return (f"  {str(plan['level']):>5}  x{plan['speed']:.3g}  replay {plan['replay_s']:.0f}초  "
+    return (f"  {plan['name']:>6}  x{plan['speed']:.3g}  replay {plan['replay_s']:.0f}초  "
             f"load {plan['load_gibps']:.2f} store {plan['store_gibps']:.2f} GiB/s "
             f"(가장 바쁜 클라이언트 {max(plan['client_gibps']['load']):.2f} · {max(plan['client_gibps']['store']):.2f})  "
-            f"디스크 읽기 {u['disk_read']:.3f} 쓰기 {u['disk_write']:.3f}  "
-            f"링크 클라이언트 {u['client_link']:.3f} storage {u['storage_link']:.3f}")
+            + (f"디스크 읽기 {u['disk_read']:.3f} 쓰기 {u['disk_write']:.3f}  "
+               f"링크 클라이언트 {u['client_link']:.3f} storage {u['storage_link']:.3f}" if u else "사용률 — 천장이 없다"))
 
 
 def main():
@@ -197,8 +198,8 @@ def main():
     ap.add_argument("trace", choices=[t[0] for t in TRACES])
     ap.add_argument("--window-start", type=float, default=30, help="replay 할 trace 구간 시작(분)")
     ap.add_argument("--window-min", type=float, default=3, help="구간 길이(분)")
-    ap.add_argument("--levels", default="0.05,0.1,0.2,0.3,0.4,max",
-                    help="storage 디스크 읽기 사용률 단계, 쉼표로. max 는 클라이언트 한계까지")
+    ap.add_argument("--speeds", default="0.5,1,2,3,4,max",
+                    help="replay 배속, 쉼표로. max 는 클라이언트 한계까지")
     ap.add_argument("--clients", type=int, default=None, help="기본: 이 클러스터의 클라이언트 수(clusters/*.toml)")
     ap.add_argument("--serving-cfg", default=str(SERVING_BASE),
                     help="서빙 설정 — 모델·GPU KV·L1 크기·정책 (기본: targets/serving-base.json)")
@@ -207,7 +208,7 @@ def main():
                     help="클라이언트 한 대 load 한계 GiB/s (기본: calibration 의 dram 값). dram_zc 로 replay 하면 올린다")
     ap.add_argument("--store-wall", type=float, default=None,
                     help="클라이언트 한 대 store 한계 GiB/s (기본: calibration 의 dram 값)")
-    ap.add_argument("--out", required=True, help="plan 폴더. 단계마다 파일 하나")
+    ap.add_argument("--out", required=True, help="plan 폴더. 배속마다 파일 하나")
     args = ap.parse_args()
 
     cfg = json.loads(Path(args.serving_cfg).read_text())
@@ -227,17 +228,16 @@ def main():
           f"3FS lookup {base['lookup_chunks']} (없는 key {base['lookup_misses']})  미리 쓸 chunk {base['prepopulate_chunks']}  "
           f"store÷load {base['store_chunks'] / max(1, base['load_chunks']):.2f}")   # 1 을 넘으면 store 벽에 먼저 걸리기 쉽다(10-24 coder 60분 1.26)
     index = []
-    for p in sweep(base, cal, args.levels.split(",")):
+    for p in sweep(base, cal, args.speeds.split(",")):
         if "skipped" in p:
-            print(f"  {p['level']:>5}  뺌 — {p['skipped']}")
+            print(f"  {p['name']:>6}  뺌 — {p['skipped']}")
             index.append(p)
             continue
-        name = "max" if p["level"] == "max" else f"read{float(p['level']):.2f}"
-        (out / f"{name}.json").write_text(json.dumps(p))
+        (out / f"{p['name']}.json").write_text(json.dumps(p))
         print(describe(p))
-        index.append({"level": p["level"], "file": f"{name}.json", "speed": p["speed"], "util": p["util"]})
+        index.append({"name": p["name"], "file": f"{p['name']}.json", "speed": p["speed"], "util": p["util"]})
     (out / "index.json").write_text(json.dumps({"trace": base["trace"], "window_min": base["window_min"],
-                                                "serving_cfg": base["serving_cfg"], "levels": index},
+                                                "serving_cfg": base["serving_cfg"], "plans": index},
                                                ensure_ascii=False, indent=1))
 
 

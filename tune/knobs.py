@@ -23,7 +23,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 OUT = HERE.parent / "results/tune"
-GRID = [0.03, 0.04, 0.05, 0.07, 0.10, 0.14, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]   # tune.py 와 같다
+GRID = [0.03, 0.04, 0.05, 0.07, 0.10, 0.14, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]   # 10-27 전 tune.py 의 단계 격자 — OUT 의 결과는 단계로 쟀다
 
 
 def K(id, layer, key, what, how, base, tier, ours=None, cands=(), when="", cost="", why=""):

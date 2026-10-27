@@ -64,16 +64,17 @@ node_id = ""                  # admin_cli list-nodes 의 STORAGE Id
 netdevs = []
 nvme = []                     # 3FS target 이 든 NVMe 장치
 
-# 천장과 3FS 구성. 단계(부하) = storage 디스크 읽기 합 ÷ disk_read_gibps
+# 3FS 구성과 (선택) 천장. 천장은 결과를 사용률(%)로 적을 때만 쓴다 — sweep 은 replay 배속으로 돈다.
+# 3FS 경로 천장(모든 클라이언트의 fio-usrbio 합)은 여기에 적지 않고 ceiling.py 가 재서 clusters/<이름>-ceiling.json 에 둔다
 [measured]
-disk_read_gibps = ""          # storage NVMe 전체 동시 읽기 합. 사양값으로 시작하면 그렇게 적어 둔다
-disk_write_gibps = ""
-link_gibps = ""               # 노드 하나의 RDMA 선로 합(GiB/s). 100 GbE 하나면 11.64
+# disk_read_gibps = ""        # (선택) storage NVMe 전체 동시 읽기 합. 사양값이면 그렇게 적어 둔다
+# disk_write_gibps = ""
+# link_gibps = ""             # (선택) 노드 하나의 RDMA 선로 합(GiB/s). 100 GbE 하나면 11.64
 replicas = ""                 # chain 마다 target 수(list-chains)
 chains = ""
 default_stripe = ""           # stat --display-layout / — 재생 폴더의 기본 layout 이다
 chunk_bytes = ""
-# client_load_wall_gibps = ""   # (선택) 클라이언트 한 대 load · store 한계. plan.py 가 넘는 단계를 빼고 "max" 를 정한다. 없으면 자르지 않는다
+# client_load_wall_gibps = ""   # (선택) 클라이언트 한 대 load · store 한계. plan.py 가 넘는 배속을 빼고 "max" 를 정한다. 없으면 자르지 않는다
 # client_store_wall_gibps = ""
 
 # (선택) 대당 미리 쓰기 속도 어림(GiB/s) — replay 의 출발 시각. 없으면 PoC 값(dram 0.35 · dram_zc 1.2 · hf3fs 1.5).
@@ -82,5 +83,9 @@ chunk_bytes = ""
 # hf3fs = 1.5
 
 # (선택) 빌드 경로. NIXL dram_zc 의 2 GiB 버그 shim(LD_PRELOAD) — 그 knob 을 쓸 때만, 클라이언트마다 같은 경로
+# fio-usrbio · 엔진 · libhf3fs_api(ceiling.py) — 클라이언트마다 같은 경로. 아래는 기본값
 # [builds]
 # pwrite_shim = "/tmp/pwrite_full.so"
+# fio_usrbio = "/opt/3fs/bin/fio-usrbio"
+# usrbio_engine = "/opt/3fs/lib/fio/hf3fs_usrbio.so"
+# hf3fs_lib = "/opt/3fs/lib"

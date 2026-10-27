@@ -18,6 +18,7 @@ LMCache 빌드는 클라이언트마다 $HOME 아래 같은 이름으로 둔다(
 import argparse
 import collections
 import json
+import math
 import os
 import shutil
 import signal
@@ -37,9 +38,10 @@ import settings as S           # noqa: E402  FUSE · storage 적용 · 확인 ·
 from guard import busy         # noqa: E402
 from replay import admin, ensure_layout     # noqa: E402
 
-OUT = SM / "results/tune"
+OUT = SM / "results/tune-speed"      # 배속 격자부터(10-27). 그 전 단계(디스크 읽기 사용률) 격자의 결과는 results/tune
 DATA = C.data("tune")
-GRID = [0.03, 0.04, 0.05, 0.07, 0.10, 0.14, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
+GRID = [float(f"{2 ** (k / 5):.3g}") for k in range(-10, 31)]   # 배속 x0.25-x64. 한 칸 15%(2^(1/5)), 다섯 칸이 두 배
+JUMP, START = 5, 1.0                 # search 는 START 에서 두 배씩 건너 경계를 찾은 뒤 한 칸씩 올린다
 MEM = "g24-l32"
 MIN_FREE = 0.15                      # 3FS 여유가 이보다 적으면 실행을 시작하지 않는다
 HF_PY = "$HOME/venv-lmcache-hf3fs/bin/python"
@@ -72,16 +74,16 @@ def native(nw, mem="dram", dio="true"):
 AT = "PYTHONPATH=$HOME/LMCache-hf3fs-atomic"
 # NIXL dram_zc 의 2 GiB 버그 shim(LD_PRELOAD). 클라이언트마다 이 경로에 있어야 한다 — 없으면 그 knob 을 돌리기 전에 멈춘다
 PW_SHIM = C.C.get("builds", {}).get("pwrite_shim", "/tmp/pwrite_full.so")
-# 버전: 빌드(클라이언트 세 대에 같은 경로), LMCache 규칙, 실제 대조에 쓸 node_up.sh 의 ADAPTER, 처음 잴 단계, adapter 설정(knob)마다 replay 인자
+# 버전: 빌드(클라이언트 세 대에 같은 경로), LMCache 규칙, 실제 대조에 쓸 node_up.sh 의 ADAPTER, adapter 설정(knob)마다 replay 인자
 VERSIONS = {
-    "dyn": dict(name="nixl_store_dynamic", build="~/LMCache 8d7d2c4", rules="8d7d2c4", real="nixl_store_dynamic", start=0.07, knobs={
+    "dyn": dict(name="nixl_store_dynamic", build="~/LMCache 8d7d2c4", rules="8d7d2c4", real="nixl_store_dynamic", knobs={
         "dram": dict(nd=1),                                                   # calibration 의 adapter (문서 예시 아님 — 문서는 mem_config 를 안 준다)
         "auto": dict(nd=1, bp=["mem_config=auto"]),                           # nixl.rst 예시 = mem_config 없음 = plugin 기본값 auto
         "dram_zc": dict(nd=1, bp=["mem_config=dram_zc"], prefix=f"LD_PRELOAD={PW_SHIM}"),   # NIXL 2 GiB 버그 shim
         "dram_zc-a4k": dict(nd=1, bp=["mem_config=dram_zc"], prefix=f"LD_PRELOAD={PW_SHIM}", l1a=4096),   # L1 정렬 LMCache 기본(4 KiB)
         "dram_zc-a2m": dict(nd=1, bp=["mem_config=dram_zc"], prefix=f"LD_PRELOAD={PW_SHIM}", l1a=2097152),
         "dram_zc-nodio": dict(nd=1, bp=["mem_config=dram_zc", "use_direct_io=false"], prefix=f"LD_PRELOAD={PW_SHIM}")}),   # O_DIRECT 끔   # 2 MiB — 8 MiB 가 나은 까닭이 huge page 경계인가
-    "nat": dict(name="nixl_native", build="~/LMCache-native 8eb36fa", rules="8d7d2c4", real=None, start=0.07, knobs={
+    "nat": dict(name="nixl_native", build="~/LMCache-native 8eb36fa", rules="8d7d2c4", real=None, knobs={
         "w4": dict(nd=1, aj=native(4), prefix="PYTHONPATH=$HOME/LMCache-native"),
         "w16": dict(nd=1, aj=native(16), prefix="PYTHONPATH=$HOME/LMCache-native"),
         "w16-a4k": dict(nd=1, aj=native(16), prefix="PYTHONPATH=$HOME/LMCache-native", l1a=4096),   # L1 정렬 LMCache 기본(4 KiB)
@@ -90,7 +92,7 @@ VERSIONS = {
         "w16-zc-a4k": dict(nd=1, aj=native(16, "dram_zc"), prefix=f"LD_PRELOAD={PW_SHIM} PYTHONPATH=$HOME/LMCache-native", l1a=4096),
         "w16-nodio": dict(nd=1, aj=native(16, dio="false"), prefix="PYTHONPATH=$HOME/LMCache-native")}),   # O_DIRECT 끔
     # 10-23 사용자: hf3fs 는 최신 버전(원자적 쓰기 패치) 하나로 잰다. 예전 버전(~/LMCache-hf3fs ecb031a, 키 "h")의 결과는 results/tune/h* 와 NOTE 에 남는다
-    "a": dict(name="hf3fs", build="~/LMCache-hf3fs-atomic (6e69015 connector)", rules="8d7d2c4", real="hf3fs-atomic", start=0.20, knobs={
+    "a": dict(name="hf3fs", build="~/LMCache-hf3fs-atomic (6e69015 connector)", rules="8d7d2c4", real="hf3fs-atomic", knobs={
         "w4-d1": dict(nd=1, aj=hf3fs(1, False), py=HF_PY, prefix=AT),
         "s16-d1": dict(nd=1, aj=hf3fs(1, True), py=HF_PY, prefix=AT),
         "s16-d16": dict(nd=16, aj=hf3fs(16, True), py=HF_PY, prefix=AT),
@@ -149,8 +151,13 @@ def shim_ok(prefix, _seen={}):
                 raise SystemExit(f"{f} 가 없다: {', '.join(_seen[f])} — 그 파일을 두거나 clusters/<이름>.toml [builds] pwrite_shim 을 고친다")
 
 
+def on_grid(x):
+    """GRID 에서 x 에 가장 가까운 배속"""
+    return min(GRID, key=lambda g: abs(math.log(g / x)))
+
+
 def data_dir(ver, knob, chunk, wm=""):
-    """버전 · knob · chunk 크기(· trace · 모델)마다 폴더 하나. 미리 쓴 chunk 를 단계 · 클러스터 설정이 바뀌어도 다시 쓴다(--keep-prepop)."""
+    """버전 · knob · chunk 크기(· trace · 모델)마다 폴더 하나. 미리 쓴 chunk 를 배속 · 클러스터 설정이 바뀌어도 다시 쓴다(--keep-prepop)."""
     nd = VERSIONS[ver]["knobs"][knob]["nd"]
     d = f"{DATA}/{ver}{wm}-{knob}" + ("" if chunk is None else f"-c{chunk >> 10}k")
     for x in [d] + ([f"{d}/p{i}" for i in range(nd)] if nd > 1 else []):
@@ -180,8 +187,8 @@ class Sweep:
         S.log(f"plan {self.fam.name}: store÷load {b['store_chunks'] / max(1, b['load_chunks']):.2f}"
               " — 1 을 넘으면 store 벽에 먼저 걸리기 쉬워 store 쪽 설정부터 본다(10-24 coder 60분)")
 
-    def run(self, tag, c, d, level):
-        out = self.out / "runs" / f"{tag}-u{level:.2f}"
+    def run(self, tag, c, d, speed):
+        out = self.out / "runs" / f"{tag}-x{speed:g}"
         if (out / "summary.json").exists():
             return out
         dl = Path(__file__).with_name("deadline")      # 있으면(epoch 초) 그 전에 끝나지 않을 실행은 시작하지 않는다
@@ -194,7 +201,7 @@ class Sweep:
         if fs.f_bavail / fs.f_blocks < MIN_FREE:
             raise SystemExit(f"3FS 여유 {fs.f_bavail / fs.f_blocks:.1%} < {MIN_FREE:.0%} — GC 가 회수하는지 먼저 본다 (gcwatch.sh)")
         shim_ok(c.get("prefix", ""))
-        plan = F.level_plan(self.fam, "full", level)
+        plan = F.speed_plan(self.fam, "full", speed)
         cmd = (f"cd {SM} && exec python3 replay.py {plan} --out {out} --procs 1 --slots {c.get('slots', 8)} --data-dir {d} --keep-prepop"
                + (f" --adapter-json '{c['aj']}'" if c.get("aj") else "")
                + (f" --python '{c['py']}'" if c.get("py") else "")
@@ -208,36 +215,46 @@ class Sweep:
             S.apply(dict(S.CUR), force=True)
         return out
 
-    def measure(self, tag, c, d, level):
-        m = A.metrics(self.run(tag, c, d, level))
-        keep = ("ok", "valid", "speed", "late_p99", "store_ratio", "missed_frac", "load_s_p99", "util_disk_read", "util_disk_write")
-        self.res.setdefault(tag, {})[f"{level:.2f}"] = {k: m.get(k) for k in keep}
+    def measure(self, tag, c, d, speed):
+        m = A.metrics(self.run(tag, c, d, speed))
+        keep = ("ok", "valid", "speed", "late_p99", "store_ratio", "missed_frac", "load_s_p99", "load", "store", "disk_read", "disk_write",
+                "util_disk_read", "util_disk_write", "of_3fs_load", "of_3fs_store")
+        self.res.setdefault(tag, {})[f"{speed:g}"] = {k: m.get(k) for k in keep}
         self.res_path.write_text(json.dumps(self.res, ensure_ascii=False, indent=1))
         print(f"{tag:22} " + A.line(m), flush=True)
         return m
 
     def search(self, tag, c, d, start):
-        """start 에서 따라가면 한 단계씩 올리고(2번 이어 실패 · 크게 실패면 멈춤), 못 따라가면 따라갈 때까지 내린다. 최대 단계."""
-        i, res = GRID.index(start), {}
-        m = res[GRID[i]] = self.measure(tag, c, d, GRID[i])
-        if m["ok"]:
+        """start 에서 두 배(JUMP 칸)씩 올려(못 따라가면 내려) 따라가는 칸을 찾고, 거기서 한 칸씩 올린다
+        (2번 이어 실패 · 크게 실패면 멈춤). 따라간 가장 높은 배속. 배속마다 trace 의 IO 양이 달라 시작점을 미리 알 수 없다"""
+        res = {}
+
+        def at(i):
+            if GRID[i] not in res:
+                res[GRID[i]] = self.measure(tag, c, d, GRID[i])
+            return res[GRID[i]]
+
+        i = GRID.index(start)
+        if at(i)["ok"]:
+            while i + JUMP < len(GRID) and at(i + JUMP)["ok"]:
+                i += JUMP
+        else:
+            while i > 0 and not at(i)["ok"]:
+                i = max(0, i - JUMP)
+        if at(i)["ok"]:
             bad = 0
             while i + 1 < len(GRID):
                 i += 1
-                m = res[GRID[i]] = self.measure(tag, c, d, GRID[i])
+                m = at(i)
                 bad = 0 if m["ok"] else bad + 1
                 if bad >= 2 or (not m["ok"] and ((m["late_p99"] or 0) > 5 or (m["store_ratio"] or 0) < 0.8)):
                     break
-        else:
-            while i > 0 and not m["ok"]:
-                i -= 1
-                m = res[GRID[i]] = self.measure(tag, c, d, GRID[i])
-        best = max((lv for lv, x in res.items() if x["ok"]), default=None)
-        S.log(f"   {tag} 최대 " + (f"{best:.2f} (x{res[best]['speed']:.2f})" if best else f"{GRID[0]:.2f} 미만"))
+        best = max((sp for sp, x in res.items() if x["ok"]), default=None)
+        S.log(f"   {tag} 최대 " + (f"x{best:g} (디스크 읽기 {res[best].get('disk_read') or 0:.2f} GiB/s)" if best else f"x{GRID[0]:g} 미만"))
         return best
 
-    def repeat(self, knobs, level, times, first=2, settings=("base",)):
-        """search 대신 그 단계만 다시 잰다(tag 끝 .r2 · .r3 …) — 한 단계 차이를 세 번 중 두 번으로 정할 때"""
+    def repeat(self, knobs, speed, times, first=2, settings=("base",)):
+        """search 대신 그 배속만 다시 잰다(tag 끝 .r2 · .r3 …) — 한 칸 차이를 세 번 중 두 번으로 정할 때"""
         for name in settings:
             f = SETTINGS[name]
             try:
@@ -247,18 +264,18 @@ class Sweep:
                 continue
             for k in knobs:
                 d = data_dir(self.ver, k, f.get("chunk"), self.wm)
-                oks = [self.measure(f"{k}+{name}.r{i}", self.v["knobs"][k], d, level)["ok"] for i in range(first, first + times)]
-                S.log(f"   {k}+{name} {level:.2f} 다시 {times}번: 통과 {sum(oks)}")
+                oks = [self.measure(f"{k}+{name}.r{i}", self.v["knobs"][k], d, speed)["ok"] for i in range(first, first + times)]
+                S.log(f"   {k}+{name} x{speed:g} 다시 {times}번: 통과 {sum(oks)}")
 
     def go(self, knobs, settings, start, set_start=None):
-        best_knob, best_lv = None, None
+        best_knob, best_sp = None, None
         S.apply({**S.BASE})
         for k in knobs:                                          # ① 클러스터 기본값에서 adapter 설정마다
-            lv = self.search(f"{k}+base", self.v["knobs"][k], data_dir(self.ver, k, None, self.wm), start)
-            if lv and (best_lv is None or lv > best_lv):
-                best_knob, best_lv = k, lv
+            sp = self.search(f"{k}+base", self.v["knobs"][k], data_dir(self.ver, k, None, self.wm), start)
+            if sp and (best_sp is None or sp > best_sp):
+                best_knob, best_sp = k, sp
         if best_knob is None:
-            S.log("어느 adapter 설정도 가장 낮은 단계를 따라가지 못했다")
+            S.log(f"어느 adapter 설정도 가장 낮은 배속 x{GRID[0]:g} 을 따라가지 못했다")
             return
         S.log(f"가장 좋은 adapter 설정: {best_knob}")
         for name in settings:                                    # ② 그 설정에서 클러스터 설정마다
@@ -270,7 +287,7 @@ class Sweep:
             except S.NotAllowed as e:
                 S.log(f"   {name}: {e} 을 바꿀 허락이 없어 건너뛴다")
                 continue
-            self.search(f"{best_knob}+{name}", self.v["knobs"][best_knob], data_dir(self.ver, best_knob, f.get("chunk"), self.wm), set_start or best_lv)
+            self.search(f"{best_knob}+{name}", self.v["knobs"][best_knob], data_dir(self.ver, best_knob, f.get("chunk"), self.wm), set_start or best_sp)
 
 
 # --- verify ---
@@ -349,10 +366,12 @@ def table():
     for d in sorted(OUT.glob("*/result.json")):
         res = json.loads(d.read_text())
         print(f"== {d.parent.name} ({VERSIONS.get(d.parent.name, {}).get('name', '')})")
-        for tag, lv in res.items():
-            ok = [float(k) for k, m in lv.items() if m["ok"]]
-            b = max(ok) if ok else None
-            print(f"  {tag:22} " + (f"x{lv[f'{b:.2f}']['speed']:.2f}" if b else f"단계 {GRID[0]:.2f} 미만"))
+        for tag, sp in res.items():
+            ok = [k for k, m in sp.items() if m["ok"]]
+            b = sp[max(ok, key=float)] if ok else None
+            print(f"  {tag:22} " + (f"x{b['speed']:.3g}" + (f"  디스크 읽기 {b['disk_read']:.2f} GiB/s" if b.get("disk_read") is not None else "")
+                                    + (f"  3FS 천장 대비 load {b['of_3fs_load']:.2f}" if b.get("of_3fs_load") is not None else "")
+                                    if b else f"x{GRID[0]:g} 미만"))
 
 
 def main():
@@ -361,13 +380,13 @@ def main():
     ap.add_argument("ver", nargs="?", choices=list(VERSIONS))
     ap.add_argument("--knobs", help="adapter 설정 (기본: 그 버전 전부)")
     ap.add_argument("--settings", default="base,b1m,r32-1m,r6,rts,c512k", help="클러스터 설정")
-    ap.add_argument("--start", type=float, help="처음 잴 단계 (기본: 버전의 start)")
+    ap.add_argument("--start", type=float, help=f"처음 잴 배속 (기본 {START:g}). 격자에서 가장 가까운 칸으로 맞춘다")
     ap.add_argument("--trace", default="coder", choices=list(WORKLOADS), help="trace 구간")
     ap.add_argument("--model", default="qwen3-14b", choices=list(MODELS), help="모델(token 당 KV 크기)")
-    ap.add_argument("--repeat", type=int, default=0, help="search 대신 --start 단계만 이 횟수만큼 다시 잰다(실험 기준 REF 에서)")
+    ap.add_argument("--repeat", type=int, default=0, help="search 대신 --start 배속만 이 횟수만큼 다시 잰다(실험 기준 REF 에서)")
     ap.add_argument("--rep-start", type=int, default=2, help="--repeat 의 tag 첫 번호(.rN) — 앞서 쓴 번호와 겹치지 않게")
-    ap.add_argument("--set-start", type=float, help="클러스터 설정 search 의 첫 단계(기본: adapter 설정의 최대 단계)")
-    ap.add_argument("--evict", help="L1 비우기 문턱/비율(LMCache 기본 0.8/0.2). plan 을 시뮬레이터로 다시 낸다 — IO 양이 바뀌니 단계가 아니라 배속으로 견준다")
+    ap.add_argument("--set-start", type=float, help="클러스터 설정 search 의 첫 배속(기본: adapter 설정의 최대 배속)")
+    ap.add_argument("--evict", help="L1 비우기 문턱/비율(LMCache 기본 0.8/0.2). plan 을 시뮬레이터로 다시 낸다(IO 양이 바뀐다)")
     args = ap.parse_args()
     if args.cmd == "table":
         return table()
@@ -383,10 +402,11 @@ def main():
     sw = Sweep(args.ver, args.trace, args.model, args.evict)
     knobs = args.knobs.split(",") if args.knobs else list(sw.v["knobs"])
     try:
+        start = on_grid(args.start or START)
         if args.repeat:
-            sw.repeat(knobs, args.start, args.repeat, args.rep_start, args.settings.split(",") if args.settings != ap.get_default("settings") else ("base",))
+            sw.repeat(knobs, start, args.repeat, args.rep_start, args.settings.split(",") if args.settings != ap.get_default("settings") else ("base",))
         else:
-            sw.go(knobs, args.settings.split(","), args.start or sw.v["start"], args.set_start)
+            sw.go(knobs, args.settings.split(","), start, args.set_start and on_grid(args.set_start))
     finally:
         S.restore()
         shutil.rmtree(DATA, ignore_errors=True)

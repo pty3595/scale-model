@@ -7,6 +7,7 @@ summary.json 의 달성량 · 사용률은 남은 store 가 다 끝날 때까지
   request 쪽  시작 늦음, request 당 load 시간(lookup 포함), 구간 안에 끝낸 load
   store 쪽    구간 안에 끝낸 store ÷ plan, 구간이 끝났을 때 남은 store(초), 못 찾은 load
   자원        디스크 읽기 · 쓰기, 링크(선로), 손실(storage NIC 수신 버림, 재전송, 받은 ÷ 쓸모)
+  천장 대비   load · store ÷ 3FS 경로 천장(ceiling.py 가 잰 값), 디스크 읽기 · 쓰기 ÷ 디스크 천장([measured]) — 있을 때만
 
 판정 (바꾸려면 verdict 만 고친다)
   request 쪽이 따라감  시작 늦음 p99 1초 미만
@@ -26,7 +27,8 @@ from hw_probe import STORAGE, summarize      # noqa: E402
 
 GIB = 2**30
 CAL = C.calibration()
-CEIL = {k: CAL["ceilings_gibps"][CAL["util_denominator"][k]]["value"] for k in ("disk_read", "disk_write", "link")}
+CEIL = {k: CAL["ceilings_gibps"][CAL["util_denominator"][k]]["value"] for k in ("disk_read", "disk_write", "link")}   # 없으면 None
+TFS = CAL.get("threefs_ceiling") or {}       # 3FS 경로 천장(ceiling.py)
 LATE_MAX, STORE_MIN, MISS_MAX = 1.0, 0.95, 0.01      # store 95%: 같은 조건(coder 0.40) 6번이 95.8~97.6% 로 흩어져 97% 선은 같은 실행끼리 갈린다
 
 
@@ -63,7 +65,7 @@ def metrics(run):
     plan_ld, plan_st = plan["load_chunks"], plan["store_chunks"]
     lr = [r for r in recs if r["want"]]
     m = {
-        "run": run.name, "trace": s["trace"], "level": float(s["level"]), "speed": s["speed"], "variant": plan.get("variant", "full"),
+        "run": run.name, "trace": s["trace"], "speed": s["speed"], "variant": plan.get("variant", "full"),
         "replay_s": T, "wall_s": s["wall_s"], "tail_s": s["wall_s"] - T, "requests": len(recs),
         "disk_f": s.get("disk_f", 1.0), "net_f": s.get("net_f", 1.0),
         "plan_load": plan_ld * gib / T, "plan_store": plan_st * gib / T,
@@ -86,6 +88,8 @@ def metrics(run):
         "client_store": {h: sum(r["n"] for r in d["store_records"] if r["ok"] and r["t"] + r["s"] <= T) * gib / T for h, d in drv.items()},
         "client_plan_store": {h: sum(len(x) for e in ev for x in e[3]) * gib / T for h, ev in zip(s["hosts"], plan["events"])},
     }
+    m["of_3fs_load"] = m["load"] / TFS["read_gibps"] if TFS else None
+    m["of_3fs_store"] = m["store"] / TFS["write_gibps"] if TFS else None
     # 하드웨어: plan 구간 안
     hw = {}
     for h in dict.fromkeys(list(s["hosts"]) + list(STORAGE)):     # storage 가 클라이언트도 맡으면 장비 하나
@@ -102,7 +106,8 @@ def metrics(run):
         ev = lambda xs, grp, key: sum(x[grp].get(key, 0) for x in xs)
         m.update({
             "disk_read": dr, "disk_write": dw,
-            "util_disk_read": dr / (CEIL["disk_read"] * m["disk_f"]), "util_disk_write": dw / (CEIL["disk_write"] * m["disk_f"]),
+            "util_disk_read": dr / (CEIL["disk_read"] * m["disk_f"]) if CEIL["disk_read"] else None,
+            "util_disk_write": dw / (CEIL["disk_write"] * m["disk_f"]) if CEIL["disk_write"] else None,
             "disk_util_pct": max(x["disk_util_pct"] for x in st), "disk_queue": max(x["disk_avg_queue"] for x in st),
             "client_rx": sum(x["roce_rx_gibps"] for x in cl), "client_tx": sum(x["roce_tx_gibps"] for x in cl),
             "client_rx_max": max(x["roce_rx_gibps"] for x in cl), "client_tx_max": max(x["roce_tx_gibps"] for x in cl),
@@ -132,7 +137,10 @@ def line(m):
     return (f"{m['run']:38} x{m['speed']:<5.2f} load {f(m['load'])}/{f(m['plan_load'])}  store {f(m['store'])}/{f(m['plan_store'])} "
             f"({f(m['store_ratio'])}, 남음 {f(m['store_left_s'], 1)}초)  늦음 p99 {f(m['late_p99'])}  load p50 {f(m['load_s_p50'])} p99 {f(m['load_s_p99'])}  "
             f"못 찾음 {f(100 * m['missed_frac'] if m['missed_frac'] is not None else None, 1)}%  "
-            f"디스크 r {f(m.get('util_disk_read'))} w {f(m.get('util_disk_write'))}  버림 {m.get('storage_rx_discards', 0):,}  "
+            f"디스크 r {f(m.get('disk_read'))} w {f(m.get('disk_write'))} GiB/s"
+            + ("" if m.get("util_disk_read") is None else f" ({f(m['util_disk_read'])} · {f(m.get('util_disk_write'))})")
+            + ("" if m["of_3fs_load"] is None else f"  3FS 천장 대비 load {f(m['of_3fs_load'])} store {f(m['of_3fs_store'])}")
+            + f"  버림 {m.get('storage_rx_discards', 0):,}  "
             f"request {mark(m['req_ok'])} store {mark(m['store_ok'])}" + ("" if m["valid"] else "  !! 무효"))
 
 

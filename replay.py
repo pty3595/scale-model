@@ -4,14 +4,14 @@
   - plan 을 각 클라이언트에 보내고, prepopulate chunk 를 쓴 뒤 같은 시각에 출발시킨다
   - 클라이언트와 storage 전부에 hw_sampler.py 를 띄운다 (CPU·디스크·RDMA·NIC)
   - 끝나면 plan 한 load/store 양과 storage 디스크가 실제로 읽고 쓴 양, request 시작 지연,
-    request 당 load 시간(lookup 포함), store 한 묶음의 지연, 사용률(디스크 읽기·쓰기, 클라이언트·storage 링크)을
+    request 당 load 시간(lookup 포함), store 한 묶음의 지연, 사용률(디스크 읽기·쓰기, 클라이언트·storage 링크 — 천장을 적었을 때)을
     summary.json 에 쓴다.
     링크 사용률은 payload 기준과 선로 기준(RDMA 포트 카운터, 헤더·재전송 포함) 둘 다 낸다
   - replay 데이터(공유 폴더)는 끝나면 비운다
-  plan 폴더를 주면 sweep 단계를 차례로 돌린다 (결과는 --out 아래 단계별 폴더)
+  plan 폴더를 주면 sweep 배속을 차례로 돌린다 (결과는 --out 아래 배속별 폴더)
 
     python3 replay.py plans/coder --out results/coder
-    python3 replay.py plans/coder/read0.10.json --out results/coder-read0.10
+    python3 replay.py plans/coder/x2.json --out results/coder-x2
 """
 
 import argparse
@@ -97,17 +97,17 @@ def main():
                     help="재생 폴더 (기본: " + DATA_DIR + "). plan 묶음마다 폴더를 따로 두고 --keep-prepop 과 함께 쓴다")
     ap.add_argument("--keep-prepop", action="store_true",
                     help="미리 쓴 chunk 를 지우지 않고 다음 실행이 다시 쓴다. 끝나면 이 실행이 새로 쓴 파일만 지운다. "
-                         "같은 plan 묶음(trace 구간 · 서빙 설정이 같은 것)을 단계만 바꿔 여러 번 돌릴 때 쓴다")
+                         "같은 plan 묶음(trace 구간 · 서빙 설정이 같은 것)을 배속만 바꿔 여러 번 돌릴 때 쓴다")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
     src = Path(args.plan)
-    if src.is_dir():              # sweep: 단계를 차례로
+    if src.is_dir():              # sweep: 배속을 차례로
         index = json.loads((src / "index.json").read_text())
-        for lv in index["levels"]:
-            if "file" in lv:
-                print(f"== {lv['level']}", flush=True)
-                replay_one(src / lv["file"], Path(args.out) / Path(lv["file"]).stem, args)
+        for p in index["plans"]:
+            if "file" in p:
+                print(f"== {p['name']}", flush=True)
+                replay_one(src / p["file"], Path(args.out) / Path(p["file"]).stem, args)
     else:
         replay_one(src, Path(args.out), args)
 
@@ -242,7 +242,7 @@ def replay_one(plan_path: Path, out: Path, args) -> None:
     gib = plan["chunk_bytes"] / GIB
     loaded = sum(r["loaded"] for r in recs)
     res = {
-        "plan": str(plan_path), "out": str(out), "level": plan.get("level"), "trace": plan["trace"], "speed": plan["speed"], "hosts": hosts,
+        "plan": str(plan_path), "out": str(out), "trace": plan["trace"], "speed": plan["speed"], "hosts": hosts,
         "stripe": args.stripe or cal["layout"]["default_stripe"], "slots": args.slots, "procs": args.procs, "max_batch": args.max_batch,
         "backend_param": args.backend_param, "adapter_json": args.adapter_json, "load_rdonly": args.load_rdonly,
         "data_dir": data_dir, "keep_prepop": args.keep_prepop,
@@ -267,21 +267,24 @@ def replay_one(plan_path: Path, out: Path, args) -> None:
         "hw": hw,
     }
     # 사용률: 디스크는 storage 합계 ÷ 천장, 링크는 가장 바쁜 NIC 한 방향 ÷ 선로 속도.
-    # 분모는 plan 을 만들 때의 천장이 아니라 지금 calibration 의 천장 x 이 실행에 건 상한 배율이다
+    # 분모는 plan 을 만들 때의 천장이 아니라 지금 calibration 의 천장 x 이 실행에 건 상한 배율이다. 천장이 없으면 None
     c = util_ceilings(cal)
-    ceil = {"disk_read": c["disk_read"] * args.disk_f, "disk_write": c["disk_write"] * args.disk_f,
-            "link": c["link"] * args.net_f}
-    rep, nodes, n = cal["replicas"]["value"], cal["storage_nodes"], len(hosts)
-    ld, st = res["achieved_gibps"]["load"], res["achieved_gibps"]["store"]
-    nic = lambda hs: max((max(hw[h]["roce_rx_gibps"], hw[h]["roce_tx_gibps"]) for h in hs if "error" not in hw[h]), default=0)
-    res["util_ceilings_gibps"], res["disk_f"], res["net_f"] = ceil, args.disk_f, args.net_f
-    res["util_planned"] = util_of(plan["load_gibps"], plan["store_gibps"], ceil, rep, nodes, n)
-    res["util"] = {
-        "disk_read": disk_r / ceil["disk_read"], "disk_write": disk_w / ceil["disk_write"],
-        "client_link": max(ld, st) / n / ceil["link"],
-        "storage_link": max(st * rep, ld + st * (rep - 1)) / nodes / ceil["link"],
-        "client_link_wire": nic(hosts) / ceil["link"], "storage_link_wire": nic(STORAGE) / ceil["link"],
-    }
+    res["disk_f"], res["net_f"] = args.disk_f, args.net_f
+    res["util_ceilings_gibps"] = res["util_planned"] = res["util"] = None
+    if all(c.values()):
+        ceil = {"disk_read": c["disk_read"] * args.disk_f, "disk_write": c["disk_write"] * args.disk_f,
+                "link": c["link"] * args.net_f}
+        rep, nodes, n = cal["replicas"]["value"], cal["storage_nodes"], len(hosts)
+        ld, st = res["achieved_gibps"]["load"], res["achieved_gibps"]["store"]
+        nic = lambda hs: max((max(hw[h]["roce_rx_gibps"], hw[h]["roce_tx_gibps"]) for h in hs if "error" not in hw[h]), default=0)
+        res["util_ceilings_gibps"] = ceil
+        res["util_planned"] = util_of(plan["load_gibps"], plan["store_gibps"], ceil, rep, nodes, n)
+        res["util"] = {
+            "disk_read": disk_r / ceil["disk_read"], "disk_write": disk_w / ceil["disk_write"],
+            "client_link": max(ld, st) / n / ceil["link"],
+            "storage_link": max(st * rep, ld + st * (rep - 1)) / nodes / ceil["link"],
+            "client_link_wire": nic(hosts) / ceil["link"], "storage_link_wire": nic(STORAGE) / ceil["link"],
+        }
     (out / "summary.json").write_text(json.dumps(res, ensure_ascii=False, indent=2))
 
     u, up = res["util"], res["util_planned"]
@@ -296,9 +299,10 @@ def replay_one(plan_path: Path, out: Path, args) -> None:
         print(f"  store 묶음 지연 p50 {ss['p50']:.2f}  p99 {ss['p99']:.2f}  최대 {ss['max']:.2f}초   "
               f"동시 store 최대 {res['max_outstanding_stores']}  실패 {res['store_failed']}   "
               f"lookup {res['lookup']['keys']} (찾음 {res['lookup']['found']})")
-    print(f"  디스크 읽기 {up['disk_read']:.3f} → {u['disk_read']:.3f}  쓰기 {up['disk_write']:.3f} → {u['disk_write']:.3f}  "
-          f"링크 클라이언트 {u['client_link']:.3f} (선로 {u['client_link_wire']:.3f})  "
-          f"storage {u['storage_link']:.3f} (선로 {u['storage_link_wire']:.3f})")
+    if u:
+        print(f"  디스크 읽기 {up['disk_read']:.3f} → {u['disk_read']:.3f}  쓰기 {up['disk_write']:.3f} → {u['disk_write']:.3f}  "
+              f"링크 클라이언트 {u['client_link']:.3f} (선로 {u['client_link_wire']:.3f})  "
+              f"storage {u['storage_link']:.3f} (선로 {u['storage_link_wire']:.3f})")
     print(f"  load  plan {e['load_gibps']:.2f} → 달성 {res['achieved_gibps']['load']:.2f} GiB/s (디스크 읽기 {disk_r:.2f})")
     print(f"  store plan {e['store_gibps']:.2f} → 달성 {res['achieved_gibps']['store']:.2f} GiB/s (디스크 쓰기 {disk_w:.2f}, "
           f"x{res['disk_write_over_store'] or 0:.2f})")
