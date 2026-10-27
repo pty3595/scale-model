@@ -281,7 +281,8 @@ def check():
 def discover(name):
     """admin_cli 와 각 노드에서 찾을 수 있는 값을 채운 초안을 낸다. [access] 는 먼저 채워 둔다.
     비어 있는 값은 기본값을 찾아 본다: admin_cli 는 3FS 기본 설치 경로, admin_host 는 이 장비, data_root 는 <계정>/scale-model,
-    클라이언트의 python 은 $HOME/venv-lmcache(-hf3fs), workdir 는 이 도구가 있는 곳. 찾은 값에는 '# 확인' 을 붙인다"""
+    클라이언트의 python 은 $HOME/venv-lmcache(-hf3fs), workdir 는 이 도구가 있는 곳. 찾은 값에는 '# 확인' 을 붙인다.
+    한 노드에 3FS 클러스터가 여럿 붙어 있을 수 있어 마운트 · FUSE 로그 · FUSE 서비스는 admin_cli 설정의 cluster_id 로 고른다"""
     t = C["threefs"]
     if not t.get("admin_host"):
         t["admin_host"] = "localhost"
@@ -291,7 +292,14 @@ def discover(name):
             raise SystemExit(f"admin_cli 를 {t['admin_host']} 의 {b} 에서 찾지 못했다 — threefs.admin_cli · admin_host 를 채운다")
         t["admin_cli"] = f"{b} -cfg {c}"
     out = DIR / f"{name}.toml"
-    print(f"{PATH.name} 의 [access] · admin_cli({t['admin_host']}: {t['admin_cli']}) 로 찾는다")
+
+    def cluster_id(line):
+        m = re.search(r"cluster_id\s*=\s*['\"]?([^'\"\s]+)", line)
+        return m.group(1) if m else ""
+
+    cfg = re.search(r"-cfg[ =](\S+)", t["admin_cli"])
+    cid = cluster_id(sudo_sh(t["admin_host"], f"grep -m1 '^cluster_id' {cfg.group(1)}", check=False)) if cfg else ""
+    print(f"{PATH.name} 의 [access] · admin_cli({t['admin_host']}: {t['admin_cli']}) 로 찾는다. cluster_id = {cid or '못 찾음'}")
     nodes = [l.split() for l in admin("list-nodes").splitlines()[1:] if l.split()]
     stor = sorted((int(f[0]), f[3]) for f in nodes if f[1] == "STORAGE")
     clients = sorted({f[8] for f in (l.split() for l in admin("list-clients").splitlines()[1:]) if len(f) > 8})
@@ -303,20 +311,28 @@ def discover(name):
             nd = sh(a, ACTIVE_NICS, check=False).split()
             p = {"nd": nd, "ip4": [n for n in nd if sh(a, f"ip -br -4 addr show {n} 2>/dev/null | awk '{{print $3}}'", check=False).strip()],
                  "nv": sh(a, "lsblk -dno NAME,TYPE | awk '$2==\"disk\" && $1 ~ /^nvme/ {print \"/dev/\"$1}'", check=False).split(),
-                 "mnt": [l.split()[1] for l in sh(a, "cat /proc/mounts").splitlines() if " fuse.hf3fs " in l]}
+                 "mnt": [f[1] for f in (l.split() for l in sh(a, "cat /proc/mounts").splitlines()) if f[0] == f"hf3fs.{cid}" and f[2] == "fuse.hf3fs"]}
             if client:
                 p["py"] = sh(a, 'for p in "$HOME/venv-lmcache/bin/python" "$HOME/venv-lmcache-hf3fs/bin/python"; do '
                                 '[ -x "$p" ] && { echo "$p"; break; }; done', check=False).strip()
                 p["wd"] = sh(a, f'for d in {shlex.quote(str(HERE))} "$HOME/scale-model"; do '
                                 '[ -f "$d/driver.py" ] && { echo "$d"; break; }; done', check=False).strip()
-                p["svc"] = sh(a, "systemctl list-units --all --type=service --no-legend --plain 'hf3fs_fuse*' 2>/dev/null | "
-                                 "awk '{print $1}' | head -1", check=False).strip().removesuffix(".service")
-                p["log"] = sudo_sh(a, "ls /var/log/3fs/hf3fs_fuse_main.log 2>/dev/null || ls /var/log/3fs/*fuse*.log 2>/dev/null | head -1",
+                # ExecStart 에 hf3fs_fuse_main 이 있는 unit 과, 그 --launcher_cfg 의 cluster_id 줄
+                rows = sudo_sh(a, "for u in $(systemctl list-units --all --type=service --no-legend --plain | awk '{print $1}'); do "
+                               'e=$(systemctl show -p ExecStart --value "$u"); case "$e" in *hf3fs_fuse_main*) ;; *) continue ;; esac; '
+                               "c=$(echo \"$e\" | grep -oE -- '--launcher_cfg[ =][^ ;]+' | head -1 | cut -c16-); "
+                               'echo "${u%.service}" "$(grep -m1 "^cluster_id" "$c" 2>/dev/null)"; done', check=False).splitlines()
+                units = [(r.split()[0], cluster_id(r)) for r in rows if r.split()]
+                p["svcs"] = [f"{u} {c or '?'}" for u, c in units]
+                # 다른 클러스터의 FUSE 를 restart 하지 않도록 cluster_id 가 맞는 것만 고른다
+                p["svc"] = next((u for u, c in units if cid and c == cid), "")
+                d = shlex.quote(f"/var/log/3fs-{cid}")
+                p["log"] = sudo_sh(a, f"for d in {d} /var/log/3fs; do ls $d/hf3fs_fuse_main.log 2>/dev/null || ls $d/*fuse*.log 2>/dev/null | head -1; done | head -1",
                                    check=False).strip()
             return p
         except Exception as e:
             print(f"  {h}: 접속 못 함({str(e)[:80]}) — 그 노드 값은 빈칸")
-            return {"nd": [], "ip4": [], "nv": [], "mnt": [], "py": "", "wd": "", "svc": "", "log": ""}
+            return {"nd": [], "ip4": [], "nv": [], "mnt": [], "py": "", "wd": "", "svc": "", "svcs": [], "log": ""}
 
     cp = {h: probe(h, client=True) for h in clients}
     me = cp.get(ME) or probe(ME, client=True)
@@ -336,13 +352,15 @@ def discover(name):
     q = lambda v: json.dumps(v, ensure_ascii=False)
     found = lambda v, what: f"{q(v)}   # 확인 — {what}" if v else f"{q('')}   # 못 찾음 — {what}"
     root = t.get("data_root") or f"{RUNS_AS or C['access']['ssh_user']}/scale-model"
+    sp = me if me.get("svc") else first
+    svc_what = f"ExecStart 에 hf3fs_fuse_main, launcher_cfg 의 cluster_id = {cid}" + (f" (후보 unit · cluster_id: {', '.join(sp['svcs'])})" if sp.get("svcs") else "")
     L = [f"# cluster.py discover 가 {ME} 에서 낸 초안. 빈칸과 '# 확인' 을 사람이 본다. 항목의 뜻은 TEMPLATE.toml", f"name = {q(name)}", "",
          "[access]"] + [f"{k} = {q(v)}" for k, v in C["access"].items()] + ["", "[threefs]",
-         f"mount = {found((me['mnt'] or first['mnt'] or [''])[0], '/proc/mounts 의 fuse.hf3fs')}",
+         f"mount = {found((me['mnt'] or first['mnt'] or [''])[0], f'/proc/mounts 첫 칸이 hf3fs.{cid}')}",
          f"data_root = {found(root, '마운트 아래 우리만 쓰는 폴더')}",
          f"admin_cli = {q(t['admin_cli'])}", f"admin_host = {q(t['admin_host'])}",
-         f"fuse_log = {found(me.get('log') or first.get('log'), '/var/log/3fs')}",
-         f"fuse_service = {found(me.get('svc') or first.get('svc'), 'systemctl 의 hf3fs_fuse*')}",
+         f"fuse_log = {found(me.get('log') or first.get('log'), f'/var/log/3fs-{cid}, 없으면 /var/log/3fs')}",
+         f"fuse_service = {found(sp.get('svc'), svc_what)}",
          f"fuse_template = {q(str(fuse.relative_to(HERE)))}   # 지금 mgmtd 의 FUSE 템플릿(되돌릴 곳)", "",
          "[allow]   # 클러스터 주인에게 묻고 채운다", "fuse_template = false", "storage_hot_update = false", "fuse_restart = false", "throttle = false", "",
          "[home]   # 되돌릴 storage hot-update 값 — storage " + (str(stor[0][0]) if stor else "") + " 의 지금 값",
