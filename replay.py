@@ -30,9 +30,10 @@ GIB = 1024**3
 HERE = Path(__file__).resolve().parent
 DATA_DIR = C.data("replay")
 REMOTE_CAL = "/tmp/scale-model-calibration.json"    # driver 가 읽는 calibration(이 클러스터의 값을 얹은 것). 모든 클라이언트에 같은 글
-STORE_WALL = 0.35       # 대당 store GiB/s — 미리 쓰기 시간 어림용
-STORE_WALL_ZC = 1.2     # dram_zc 의 미리 쓰기는 대당 약 1.65 GiB/s (2026-10-08, 89 GiB 55초)
-STORE_WALL_HF3FS = 1.5  # hf3fs adapter 는 한 대만 쓸 때 약 3.2 GiB/s (2026-10-12, lmcache bench l2)
+# 대당 미리 쓰기 GiB/s — 출발 시각을 정하는 어림. 기본은 PoC(spark)에서 잰 값이고 clusters/<이름>.toml 의 [prepop_gibps] 로 바꾼다.
+# 느리게 잡으면 출발만 늦고, 빠르게 잡으면 미리 쓰기가 덜 끝나 그 실행이 무효다(start_gap 음수)
+# dram 0.35 · dram_zc 1.2(2026-10-08, 89 GiB 55초에 약 1.65) · hf3fs 1.5(2026-10-12, 한 대만 쓸 때 약 3.2)
+PREPOP_GIBPS = dict(dict(dram=0.35, dram_zc=1.2, hf3fs=1.5), **C.C.get("prepop_gibps", {}))
 
 
 def files_under(d: str) -> set:
@@ -143,25 +144,24 @@ def replay_one(plan_path: Path, out: Path, args) -> None:
     remote_plan = "/tmp/scale-model-replay-plan.json"
     for h, addr in ip.items():
         if h in hosts:
-            subprocess.run(["bash", "-c", f"SM_MOUNT={C.MOUNT} bash -s"] if addr is None else C.ssh(addr) + [f"SM_MOUNT={C.MOUNT} bash -s"],
-                           input=clean, text=True, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(C.remote(addr, f"SM_MOUNT={C.MOUNT} bash -s"), input=clean, text=True, check=True, stdout=subprocess.DEVNULL)
         if addr is None:
             Path("/tmp/hw_sampler.py").write_text(sampler)
             Path(remote_plan).write_text(plan_text)
             Path(REMOTE_CAL).write_text(cal_text)
         else:
-            subprocess.run(C.ssh(addr) + ["cat > /tmp/hw_sampler.py"], input=sampler, text=True, check=True)
+            subprocess.run(C.remote(addr, "cat > /tmp/hw_sampler.py"), input=sampler, text=True, check=True)
             if h in hosts:
                 for f, text in ((remote_plan, plan_text), (REMOTE_CAL, cal_text), (f"{by_host[h]['workdir']}/driver.py", driver_text)):
-                    subprocess.run(C.ssh(addr) + [f"cat > {f}"], input=text, text=True, check=True)
+                    subprocess.run(C.remote(addr, f"cat > {f}"), input=text, text=True, check=True)
 
     pids0 = C.storage_pids()       # 끝난 뒤와 다르면 그 사이 storage 가 다시 떴다(hot-update 가 풀린다) — 이 실행은 무효
     # 미리 쓰기가 끝날 시간을 어림해 출발 시각을 정한다
     prep_gib = max(len(p) for p in plan["prepopulate"]) * plan["chunk_bytes"] / GIB
     if args.keep_prepop and os.path.isdir(data_dir) and len(files_under(data_dir)) >= sum(len(p) for p in plan["prepopulate"]):
         prep_gib = 0          # 앞 실행이 남긴 것을 그대로 쓴다. 빠진 것이 있으면 driver 가 쓰고, 늦으면 start_gap_s 가 음수로 남는다
-    wall = (STORE_WALL_HF3FS if '"hf3fs"' in (args.adapter_json or "") else
-            STORE_WALL_ZC if "mem_config=dram_zc" in args.backend_param else STORE_WALL)
+    wall = PREPOP_GIBPS["hf3fs" if '"hf3fs"' in (args.adapter_json or "") else
+                        "dram_zc" if "mem_config=dram_zc" in args.backend_param else "dram"]
     start_at = time.time() + 40 + 1.5 * prep_gib / wall
     total = start_at - time.time() + plan["replay_s"] * 2 + 120
     for h, addr in ip.items():
@@ -209,7 +209,7 @@ def replay_one(plan_path: Path, out: Path, args) -> None:
         for j in range(args.procs):
             path = f"/tmp/scale-model-replay-{c['host']}-{j}.json"
             parts.append(json.loads(Path(path).read_text() if ip[c["host"]] is None else
-                                    subprocess.run(C.ssh(c["addr"]) + [f"cat {path}"], capture_output=True,
+                                    subprocess.run(C.remote(c["addr"], f"cat {path}"), capture_output=True,
                                                    text=True, check=True).stdout))
         d = dict(parts[0], procs=args.procs)
         for k in ("records", "store_records"):

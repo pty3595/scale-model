@@ -32,12 +32,13 @@ def _pick():
     name = os.environ.get("SM_CLUSTER")
     if name:
         return DIR / f"{name}.toml"
-    for f in sorted(DIR.glob("*.toml")):
-        if f.name == "TEMPLATE.toml" or f.stem.endswith("-fuse"):
-            continue
-        if any(c.get("host") == ME for c in tomllib.loads(f.read_text()).get("client", [])):
-            return f
-    raise SystemExit(f"이 장비({ME})가 클라이언트로 든 클러스터 파일이 {DIR} 에 없다 — TEMPLATE.toml 을 복사해 채운다(cluster.py discover)")
+    hit = [f for f in sorted(DIR.glob("*.toml")) if f.name != "TEMPLATE.toml" and not f.stem.endswith("-fuse")
+           and any(c.get("host") == ME for c in tomllib.loads(f.read_text()).get("client", []))]
+    if len(hit) > 1:
+        raise SystemExit(f"이 장비({ME})가 든 클러스터 파일이 둘 이상이다({', '.join(f.name for f in hit)}) — SM_CLUSTER=<이름> 으로 고른다")
+    if not hit:
+        raise SystemExit(f"이 장비({ME})가 클라이언트로 든 클러스터 파일이 {DIR} 에 없다 — TEMPLATE.toml 을 복사해 채운다(cluster.py discover)")
+    return hit[0]
 
 
 def _blanks(x, at=""):
@@ -99,25 +100,44 @@ def sudo():
     return f"echo {shlex.quote(pw)} | sudo -S -p ''" if pw else "sudo -n"
 
 
+# 원격에서 replay · 표본 · 파일 복사를 돌릴 계정. ssh_user 와 다르면 ssh_user 가 비밀번호 없이 그 계정이 된다(sudo -n -u).
+# 그 계정의 login 환경과 $HOME 으로 돈다. root 명령(admin_cli · FUSE 로그 · storage 설정)은 늘 ssh_user 의 sudo 로
+RUNS_AS = C["access"].get("runs_as", "")
+if RUNS_AS and C["access"].get("sudo_password_file"):
+    raise SystemExit("access.runs_as 는 ssh_user 가 비밀번호 없이 그 계정이 될 때만 쓴다(sudo -n -u) — sudo_password_file 을 비운다")
+
+
+def remote(a, cmd):
+    """a(None 이면 이 장비)에서 bash 명령을 도는 argv"""
+    if a is None:
+        return ["bash", "-c", cmd]
+    return ssh(a) + [f"sudo -n -u {RUNS_AS} -H bash -lc {shlex.quote(cmd)}" if RUNS_AS else cmd]
+
+
+def _run(argv, what, check):
+    r = subprocess.run(argv, capture_output=True, text=True)
+    if check and r.returncode:
+        raise RuntimeError(f"{what[:120]}… 실패 {r.returncode}: {r.stderr.strip()[:300]}")
+    return r.stdout
+
+
 def run_on(a, cmd, **kw):
     """a(None 이면 이 장비)에서 bash 명령. Popen"""
-    return subprocess.Popen(["bash", "-c", cmd] if a is None else ssh(a) + [cmd], **kw)
+    return subprocess.Popen(remote(a, cmd), **kw)
 
 
 def sh(a, cmd, check=True):
-    r = subprocess.run(["bash", "-c", cmd] if a is None else ssh(a) + [cmd], capture_output=True, text=True)
-    if check and r.returncode:
-        raise RuntimeError(f"{a or ME}: {cmd[:80]}… 실패 {r.returncode}: {r.stderr.strip()[:300]}")
-    return r.stdout
+    return _run(remote(a, cmd), f"{a or ME}: {cmd}", check)
 
 
 def sudo_sh(a, cmd, check=True):
     """root 로 돈다. 이 장비에서도 ssh_user 로 접속해 sudo 한다(작업 계정에 sudo 가 없을 수 있다)"""
-    return sh(a or "localhost", f"{sudo()} bash -c {shlex.quote(cmd)}", check)
+    return _run(ssh(a or "localhost") + [f"{sudo()} bash -c {shlex.quote(cmd)}"], f"{a or ME}: sudo {cmd}", check)
 
 
 def admin(cmd):
-    return sh(C["threefs"]["admin_host"], f"{sudo()} {C['threefs']['admin_cli']} {shlex.quote(cmd)} 2>/dev/null")
+    return _run(ssh(C["threefs"]["admin_host"]) + [f"{sudo()} {C['threefs']['admin_cli']} {shlex.quote(cmd)} 2>/dev/null"],
+                f"admin_cli {cmd}", True)
 
 
 def put_admin(local, remote):
@@ -170,10 +190,22 @@ def calibration():
     for k, v in (("disk_read", m["disk_read_gibps"]), ("disk_write", m["disk_write_gibps"]), ("link", m["link_gibps"])):
         cal["ceilings_gibps"][d[k]] = dict(cal["ceilings_gibps"][d[k]], value=v)
     cal["replicas"] = dict(cal["replicas"], value=m["replicas"])
+    # 클라이언트 한 대 한계(plan.py 가 넘는 단계를 빼고 "max" 를 정한다). 그 클러스터에서 잰 값이 없으면 자르지 않는다
+    cal["client_wall"] = dict(cal["client_wall"], paced_gibps=m.get("client_load_wall_gibps"))
+    cal["store_wall"] = dict(cal["store_wall"], overlap_gibps=m.get("client_store_wall_gibps"))
     cal["layout"] = dict(cal["layout"], chains=m["chains"], default_stripe=m["default_stripe"], chunk_bytes=m["chunk_bytes"])
     cal["adapter"] = copy.deepcopy(cal["adapter"])
     cal["adapter"]["backend_params"]["mount_point"] = MOUNT
     return cal
+
+
+# netdev 하나의 RDMA 장치 · 포트 상태 · 링크 · IPv4. 3FS 는 RDMA 포트가 ACTIVE 면 되고 IPv4 는 없어도 된다(InfiniBand 등)
+NIC_STATE = ("ib=$(ls /sys/class/net/{nd}/device/infiniband 2>/dev/null | head -1); "
+             "echo \"$ib|$(cat /sys/class/infiniband/$ib/ports/1/state 2>/dev/null)|$(cat /sys/class/net/{nd}/operstate 2>/dev/null)|"
+             "$(ip -br -4 addr show {nd} 2>/dev/null | awk '{{print $3}}')\"")
+# RDMA 포트가 ACTIVE 인 netdev 들
+ACTIVE_NICS = ("for d in /sys/class/infiniband/*; do grep -q ACTIVE $d/ports/1/state 2>/dev/null || continue; "
+               "for n in $d/device/net/*; do [ -e \"$n\" ] && basename $n; done; done")
 
 
 # --- 명령 ---
@@ -225,8 +257,8 @@ def check():
             ok(f"{h} 접속", sh(a, "hostname").strip() == h)
             ok(f"{h} sudo", sudo_sh(a, "id -u").strip() == "0")
             for nd in n["netdevs"]:
-                ib = sh(a, f"ls /sys/class/net/{nd}/device/infiniband 2>/dev/null; ip -br -4 addr show {nd} 2>/dev/null", check=False).split()
-                ok(f"{h} {nd} RDMA · IPv4", len(ib) >= 3 and ib[2] == "UP", " ".join(ib))
+                ib, st, op, ip4 = (sh(a, NIC_STATE.format(nd=nd), check=False).strip().split("|") + ["", "", "", ""])[:4]
+                ok(f"{h} {nd} RDMA 포트", bool(ib) and "ACTIVE" in st, f"{ib or 'RDMA 장치 없음'} {st} · {op} · {ip4 or 'IPv4 없음'}")
             if h in CLIENT_SET:
                 c = next(x for x in CLIENTS if x["host"] == h)
                 ok(f"{h} 3FS 마운트", f" {MOUNT} fuse.hf3fs " in sh(a, "cat /proc/mounts"))
@@ -247,31 +279,52 @@ def check():
 
 
 def discover(name):
-    """admin_cli 와 각 노드에서 찾을 수 있는 값을 채운 초안을 낸다. [access] 와 threefs.admin_cli · admin_host 는 먼저 채워 둔다"""
+    """admin_cli 와 각 노드에서 찾을 수 있는 값을 채운 초안을 낸다. [access] 는 먼저 채워 둔다.
+    비어 있는 값은 기본값을 찾아 본다: admin_cli 는 3FS 기본 설치 경로, admin_host 는 이 장비, data_root 는 <계정>/scale-model,
+    클라이언트의 python 은 $HOME/venv-lmcache(-hf3fs), workdir 는 이 도구가 있는 곳. 찾은 값에는 '# 확인' 을 붙인다"""
+    t = C["threefs"]
+    if not t.get("admin_host"):
+        t["admin_host"] = "localhost"
+    if not t.get("admin_cli"):
+        b, c = "/opt/3fs/bin/admin_cli", "/opt/3fs/etc/admin_cli.toml"
+        if sudo_sh(t["admin_host"], f"test -x {b} && test -f {c} && echo y", check=False).strip() != "y":
+            raise SystemExit(f"admin_cli 를 {t['admin_host']} 의 {b} 에서 찾지 못했다 — threefs.admin_cli · admin_host 를 채운다")
+        t["admin_cli"] = f"{b} -cfg {c}"
     out = DIR / f"{name}.toml"
-    print(f"{PATH.name} 의 [access] · admin_cli 로 찾는다")
+    print(f"{PATH.name} 의 [access] · admin_cli({t['admin_host']}: {t['admin_cli']}) 로 찾는다")
     nodes = [l.split() for l in admin("list-nodes").splitlines()[1:] if l.split()]
     stor = sorted((int(f[0]), f[3]) for f in nodes if f[1] == "STORAGE")
     clients = sorted({f[8] for f in (l.split() for l in admin("list-clients").splitlines()[1:]) if len(f) > 8})
     res = lambda h: (subprocess.run(["getent", "hosts", h], capture_output=True, text=True).stdout.split() or [""])[0]
 
-    def probe(h):
+    def probe(h, client=False):
         a = None if h == ME else res(h)
         try:
-            nd = sh(a, "for d in /sys/class/infiniband/*/device/net/*; do n=$(basename $d); "
-                       "ip -br -4 addr show $n | awk '$2==\"UP\" && $3 {print $1}'; done", check=False).split()
-            nv = sh(a, "lsblk -dno NAME,TYPE | awk '$2==\"disk\" && $1 ~ /^nvme/ {print \"/dev/\"$1}'", check=False).split()
-            mnt = [l.split()[1] for l in sh(a, "cat /proc/mounts").splitlines() if " fuse.hf3fs " in l]
-            return nd, nv, mnt
+            nd = sh(a, ACTIVE_NICS, check=False).split()
+            p = {"nd": nd, "ip4": [n for n in nd if sh(a, f"ip -br -4 addr show {n} 2>/dev/null | awk '{{print $3}}'", check=False).strip()],
+                 "nv": sh(a, "lsblk -dno NAME,TYPE | awk '$2==\"disk\" && $1 ~ /^nvme/ {print \"/dev/\"$1}'", check=False).split(),
+                 "mnt": [l.split()[1] for l in sh(a, "cat /proc/mounts").splitlines() if " fuse.hf3fs " in l]}
+            if client:
+                p["py"] = sh(a, 'for p in "$HOME/venv-lmcache/bin/python" "$HOME/venv-lmcache-hf3fs/bin/python"; do '
+                                '[ -x "$p" ] && { echo "$p"; break; }; done', check=False).strip()
+                p["wd"] = sh(a, f'for d in {shlex.quote(str(HERE))} "$HOME/scale-model"; do '
+                                '[ -f "$d/driver.py" ] && { echo "$d"; break; }; done', check=False).strip()
+                p["svc"] = sh(a, "systemctl list-units --all --type=service --no-legend --plain 'hf3fs_fuse*' 2>/dev/null | "
+                                 "awk '{print $1}' | head -1", check=False).strip().removesuffix(".service")
+                p["log"] = sudo_sh(a, "ls /var/log/3fs/hf3fs_fuse_main.log 2>/dev/null || ls /var/log/3fs/*fuse*.log 2>/dev/null | head -1",
+                                   check=False).strip()
+            return p
         except Exception as e:
             print(f"  {h}: 접속 못 함({str(e)[:80]}) — 그 노드 값은 빈칸")
-            return [], [], []
+            return {"nd": [], "ip4": [], "nv": [], "mnt": [], "py": "", "wd": "", "svc": "", "log": ""}
 
-    mnt = probe(ME)[2]
+    cp = {h: probe(h, client=True) for h in clients}
+    me = cp.get(ME) or probe(ME, client=True)
+    first = next(iter(cp.values()), me)
     fuse = DIR / f"{name}-fuse.toml"
     tmp = "/tmp/sm-fuse-tpl.toml"
     admin(f"get-config -t FUSE -o {tmp}")
-    fuse.write_text(sudo_sh(C["threefs"]["admin_host"], f"cat {tmp}; rm -f {tmp}"))
+    fuse.write_text(sudo_sh(t["admin_host"], f"cat {tmp}; rm -f {tmp}"))
     st0 = storage_config(stor[0][0]) if stor else ""
 
     def get(sec, key, text=st0):
@@ -281,12 +334,16 @@ def discover(name):
     lay = {l.split()[0]: l.split()[-1] for l in admin("stat --display-layout /").splitlines() if l.startswith("Layout-")}
     chains = [l for l in admin("list-chains").splitlines()[1:] if l.split()]
     q = lambda v: json.dumps(v, ensure_ascii=False)
+    found = lambda v, what: f"{q(v)}   # 확인 — {what}" if v else f"{q('')}   # 못 찾음 — {what}"
+    root = t.get("data_root") or f"{RUNS_AS or C['access']['ssh_user']}/scale-model"
     L = [f"# cluster.py discover 가 {ME} 에서 낸 초안. 빈칸과 '# 확인' 을 사람이 본다. 항목의 뜻은 TEMPLATE.toml", f"name = {q(name)}", "",
          "[access]"] + [f"{k} = {q(v)}" for k, v in C["access"].items()] + ["", "[threefs]",
-         f"mount = {q(mnt[0] if mnt else '')}", f"data_root = {q(C['threefs'].get('data_root', ''))}   # 확인 — 마운트 아래 우리만 쓰는 폴더",
-         f"admin_cli = {q(C['threefs']['admin_cli'])}", f"admin_host = {q(C['threefs']['admin_host'])}",
-         f"fuse_log = {q('/var/log/3fs/hf3fs_fuse_main.log' if os.path.exists('/var/log/3fs/hf3fs_fuse_main.log') else '')}",
-         'fuse_service = "hf3fs_fuse_main"   # 확인', f"fuse_template = {q(str(fuse.relative_to(HERE)))}   # 지금 mgmtd 의 FUSE 템플릿(되돌릴 곳)", "",
+         f"mount = {found((me['mnt'] or first['mnt'] or [''])[0], '/proc/mounts 의 fuse.hf3fs')}",
+         f"data_root = {found(root, '마운트 아래 우리만 쓰는 폴더')}",
+         f"admin_cli = {q(t['admin_cli'])}", f"admin_host = {q(t['admin_host'])}",
+         f"fuse_log = {found(me.get('log') or first.get('log'), '/var/log/3fs')}",
+         f"fuse_service = {found(me.get('svc') or first.get('svc'), 'systemctl 의 hf3fs_fuse*')}",
+         f"fuse_template = {q(str(fuse.relative_to(HERE)))}   # 지금 mgmtd 의 FUSE 템플릿(되돌릴 곳)", "",
          "[allow]   # 클러스터 주인에게 묻고 채운다", "fuse_template = false", "storage_hot_update = false", "fuse_restart = false", "throttle = false", "",
          "[home]   # 되돌릴 storage hot-update 값 — storage " + (str(stor[0][0]) if stor else "") + " 의 지금 값",
          f"rts = {q('on' if get('server.storage', 'rdma_transmission_req_timeout') not in ('', '0ns', '0ms') else 'off')}",
@@ -295,14 +352,16 @@ def discover(name):
          f"st_rdma = {q(get('server.storage', 'max_concurrent_rdma_writes') + '/' + get('server.storage', 'max_concurrent_rdma_reads'))}", "",
          "[ref]   # 실험 기준 = 3FS 소스 기본값(10-21 사용자). 쓰기 둘은 FUSE 를 다시 띄워야 바뀌어 지금 걸린 값으로 돈다",
          'read = "32/8"', 'batch = "4MB"', 'rdma = "false"', 'conn = "1"', 'mct = "64"', 'rts = "off"',
-         'coro = "64/8"', 'tsel = "Default"', ""]
-    for h in clients:
-        nd, _, _ = probe(h)
-        L += ["[[client]]", f"host = {q(h)}", f"addr = {q(res(h))}", f"python = {q('')}   # LMCache 가 든 venv 의 python",
-              f"workdir = {q('')}   # 이 도구 사본", f"netdevs = {q(nd)}", ""]
+         'coro = "64/8"', 'tsel = "Default"', "",
+         "# 클라이언트 = list-clients 의 FUSE 클라이언트 전부. replay 에 쓰지 않을 노드(GPU 노드 등)는 지운다"]
+    for h, p in cp.items():
+        L += ["[[client]]", f"host = {q(h)}", f"addr = {q(res(h))}", f"python = {found(p['py'], 'LMCache 가 든 venv 의 python')}",
+              f"workdir = {found(p['wd'], '이 도구 사본')}",
+              f"netdevs = {q(p['nd'])}   # 확인 — RDMA 포트가 ACTIVE 인 것. 3FS 가 쓰는 것만 남긴다(IPv4 있는 것: {', '.join(p['ip4']) or '없음'})", ""]
     for nid, h in stor:
-        nd, nv, _ = probe(h)
-        L += ["[[storage]]", f"host = {q(h)}", f"addr = {q(res(h))}", f"node_id = {nid}", f"netdevs = {q(nd)}", f"nvme = {q(nv)}", ""]
+        p = cp.get(h) or probe(h)
+        L += ["[[storage]]", f"host = {q(h)}", f"addr = {q(res(h))}", f"node_id = {nid}",
+              f"netdevs = {q(p['nd'])}   # 확인(IPv4 있는 것: {', '.join(p['ip4']) or '없음'})", f"nvme = {q(p['nv'])}   # 확인 — 3FS target 이 든 것만", ""]
     L += ["[measured]   # 천장은 사양값으로 시작해도 된다(그때는 그렇게 적는다). 3FS 구성은 admin_cli 에서",
           'disk_read_gibps = ""', 'disk_write_gibps = ""', 'link_gibps = ""   # 노드 하나의 RDMA 선로 합(GiB/s)',
           f"replicas = {max((len(re.findall(r'\d+\([A-Z-]+\)', c)) for c in chains), default=0) or q('')}   # 확인 — list-chains",

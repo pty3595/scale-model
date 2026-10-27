@@ -70,22 +70,24 @@ def native(nw, mem="dram", dio="true"):
 
 
 AT = "PYTHONPATH=$HOME/LMCache-hf3fs-atomic"
+# NIXL dram_zc 의 2 GiB 버그 shim(LD_PRELOAD). 클라이언트마다 이 경로에 있어야 한다 — 없으면 그 knob 을 돌리기 전에 멈춘다
+PW_SHIM = C.C.get("builds", {}).get("pwrite_shim", "/tmp/pwrite_full.so")
 # 버전: 빌드(클라이언트 세 대에 같은 경로), LMCache 규칙, 실제 대조에 쓸 node_up.sh 의 ADAPTER, 처음 잴 단계, adapter 설정(knob)마다 replay 인자
 VERSIONS = {
     "dyn": dict(name="nixl_store_dynamic", build="~/LMCache 8d7d2c4", rules="8d7d2c4", real="nixl_store_dynamic", start=0.07, knobs={
         "dram": dict(nd=1),                                                   # calibration 의 adapter (문서 예시 아님 — 문서는 mem_config 를 안 준다)
         "auto": dict(nd=1, bp=["mem_config=auto"]),                           # nixl.rst 예시 = mem_config 없음 = plugin 기본값 auto
-        "dram_zc": dict(nd=1, bp=["mem_config=dram_zc"], prefix="LD_PRELOAD=/tmp/pwrite_full.so"),   # NIXL 2 GiB 버그 shim
-        "dram_zc-a4k": dict(nd=1, bp=["mem_config=dram_zc"], prefix="LD_PRELOAD=/tmp/pwrite_full.so", l1a=4096),   # L1 정렬 LMCache 기본(4 KiB)
-        "dram_zc-a2m": dict(nd=1, bp=["mem_config=dram_zc"], prefix="LD_PRELOAD=/tmp/pwrite_full.so", l1a=2097152),
-        "dram_zc-nodio": dict(nd=1, bp=["mem_config=dram_zc", "use_direct_io=false"], prefix="LD_PRELOAD=/tmp/pwrite_full.so")}),   # O_DIRECT 끔   # 2 MiB — 8 MiB 가 나은 까닭이 huge page 경계인가
+        "dram_zc": dict(nd=1, bp=["mem_config=dram_zc"], prefix=f"LD_PRELOAD={PW_SHIM}"),   # NIXL 2 GiB 버그 shim
+        "dram_zc-a4k": dict(nd=1, bp=["mem_config=dram_zc"], prefix=f"LD_PRELOAD={PW_SHIM}", l1a=4096),   # L1 정렬 LMCache 기본(4 KiB)
+        "dram_zc-a2m": dict(nd=1, bp=["mem_config=dram_zc"], prefix=f"LD_PRELOAD={PW_SHIM}", l1a=2097152),
+        "dram_zc-nodio": dict(nd=1, bp=["mem_config=dram_zc", "use_direct_io=false"], prefix=f"LD_PRELOAD={PW_SHIM}")}),   # O_DIRECT 끔   # 2 MiB — 8 MiB 가 나은 까닭이 huge page 경계인가
     "nat": dict(name="nixl_native", build="~/LMCache-native 8eb36fa", rules="8d7d2c4", real=None, start=0.07, knobs={
         "w4": dict(nd=1, aj=native(4), prefix="PYTHONPATH=$HOME/LMCache-native"),
         "w16": dict(nd=1, aj=native(16), prefix="PYTHONPATH=$HOME/LMCache-native"),
         "w16-a4k": dict(nd=1, aj=native(16), prefix="PYTHONPATH=$HOME/LMCache-native", l1a=4096),   # L1 정렬 LMCache 기본(4 KiB)
         # 10-22: nixl_store_dynamic 은 dram → dram_zc 가 0.07 → 0.20 이었다. native 는 dram 으로만 쟀다
-        "w16-zc": dict(nd=1, aj=native(16, "dram_zc"), prefix="LD_PRELOAD=/tmp/pwrite_full.so PYTHONPATH=$HOME/LMCache-native"),
-        "w16-zc-a4k": dict(nd=1, aj=native(16, "dram_zc"), prefix="LD_PRELOAD=/tmp/pwrite_full.so PYTHONPATH=$HOME/LMCache-native", l1a=4096),
+        "w16-zc": dict(nd=1, aj=native(16, "dram_zc"), prefix=f"LD_PRELOAD={PW_SHIM} PYTHONPATH=$HOME/LMCache-native"),
+        "w16-zc-a4k": dict(nd=1, aj=native(16, "dram_zc"), prefix=f"LD_PRELOAD={PW_SHIM} PYTHONPATH=$HOME/LMCache-native", l1a=4096),
         "w16-nodio": dict(nd=1, aj=native(16, dio="false"), prefix="PYTHONPATH=$HOME/LMCache-native")}),   # O_DIRECT 끔
     # 10-23 사용자: hf3fs 는 최신 버전(원자적 쓰기 패치) 하나로 잰다. 예전 버전(~/LMCache-hf3fs ecb031a, 키 "h")의 결과는 results/tune/h* 와 NOTE 에 남는다
     "a": dict(name="hf3fs", build="~/LMCache-hf3fs-atomic (6e69015 connector)", rules="8d7d2c4", real="hf3fs-atomic", start=0.20, knobs={
@@ -133,6 +135,20 @@ def family(rules, wl="coder", model="qwen3-14b", ev=None):
 
 
 # --- 재생 폴더 ---
+STRIPE, CHUNK = C.C["measured"]["default_stripe"], C.C["measured"]["chunk_bytes"]   # 그 클러스터의 3FS 기본 layout
+
+
+def shim_ok(prefix, _seen={}):
+    """prefix 가 LD_PRELOAD 를 쓰면 그 파일이 모든 클라이언트에 있는지 본다(파일마다 한 번)"""
+    for w in prefix.split():
+        if w.startswith("LD_PRELOAD="):
+            f = w.split("=", 1)[1]
+            if f not in _seen:
+                _seen[f] = [c["host"] for c in C.CLIENTS if C.sh(C.addr(c["host"]), f"test -f {f} && echo y", check=False).strip() != "y"]
+            if _seen[f]:
+                raise SystemExit(f"{f} 가 없다: {', '.join(_seen[f])} — 그 파일을 두거나 clusters/<이름>.toml [builds] pwrite_shim 을 고친다")
+
+
 def data_dir(ver, knob, chunk, wm=""):
     """버전 · knob · chunk 크기(· trace · 모델)마다 폴더 하나. 미리 쓴 chunk 를 단계 · 클러스터 설정이 바뀌어도 다시 쓴다(--keep-prepop)."""
     nd = VERSIONS[ver]["knobs"][knob]["nd"]
@@ -142,11 +158,11 @@ def data_dir(ver, knob, chunk, wm=""):
             os.makedirs(x, exist_ok=True)
             os.chmod(x, 0o777)
         else:
-            ensure_layout(x, 8, chunk)             # 하위 폴더에도 layout 을 직접 건다
+            ensure_layout(x, STRIPE, chunk)        # 하위 폴더에도 layout 을 직접 건다
     lay = {l.split()[0]: l.split()[-1] for l in admin(f"stat --display-layout {C.rel(d)}").splitlines()
            if l.startswith("Layout-")}
-    if lay.get("Layout-ChunkSize") != str(chunk or 1048576):
-        raise SystemExit(f"{d} chunk {lay.get('Layout-ChunkSize')} (원한 것 {chunk or 1048576})")
+    if lay.get("Layout-ChunkSize") != str(chunk or CHUNK):
+        raise SystemExit(f"{d} chunk {lay.get('Layout-ChunkSize')} (원한 것 {chunk or CHUNK})")
     return d
 
 
@@ -177,6 +193,7 @@ class Sweep:
         fs = os.statvfs(C.MOUNT)                       # 10-21: 지운 파일이 회수되지 않아 3FS 가 98% 찼다
         if fs.f_bavail / fs.f_blocks < MIN_FREE:
             raise SystemExit(f"3FS 여유 {fs.f_bavail / fs.f_blocks:.1%} < {MIN_FREE:.0%} — GC 가 회수하는지 먼저 본다 (gcwatch.sh)")
+        shim_ok(c.get("prefix", ""))
         plan = F.level_plan(self.fam, "full", level)
         cmd = (f"cd {SM} && exec python3 replay.py {plan} --out {out} --procs 1 --slots {c.get('slots', 8)} --data-dir {d} --keep-prepop"
                + (f" --adapter-json '{c['aj']}'" if c.get("aj") else "")

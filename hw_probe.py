@@ -10,6 +10,7 @@ CPU·디스크·RoCE 카운터를 장비별로 요약한다.
 
 import argparse
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -33,7 +34,9 @@ run_on = C.run_on
 
 
 def sampler_cmd(host: str, seconds: float) -> str:
-    return (f"nohup python3 /tmp/hw_sampler.py {seconds} {','.join(C.NODES[host]['netdevs'])} > /tmp/hw_sampler.out 2>&1 & "
+    n = C.NODES[host]
+    disks = ",".join(os.path.basename(d) for d in n.get("nvme", [])) or "-"      # storage 의 3FS NVMe 만 잰다
+    return (f"nohup python3 /tmp/hw_sampler.py {seconds} {','.join(n['netdevs'])} {disks} > /tmp/hw_sampler.out 2>&1 & "
             "echo $! > /tmp/hw_sampler.pid")
 
 
@@ -135,9 +138,9 @@ def main():
     sampler = (HERE / "hw_sampler.py").read_text()
     for h, ip in hosts.items():
         if ip is not None:
-            subprocess.run(C.ssh(ip) + ["cat > /tmp/hw_sampler.py"], input=sampler, text=True, check=True)
+            subprocess.run(C.remote(ip, "cat > /tmp/hw_sampler.py"), input=sampler, text=True, check=True)
             if h in by_host:
-                subprocess.run(C.ssh(ip) + ["cat > /tmp/scale-model-calibration.json"], input=cal_text, text=True, check=True)
+                subprocess.run(C.remote(ip, "cat > /tmp/scale-model-calibration.json"), input=cal_text, text=True, check=True)
         else:
             Path("/tmp/hw_sampler.py").write_text(sampler)
             Path("/tmp/scale-model-calibration.json").write_text(cal_text)
@@ -195,7 +198,7 @@ def main():
     for c in clients:
         path = f"/tmp/scale-model-hwprobe-{c['host']}.json"
         txt = (Path(path).read_text() if hosts[c["host"]] is None else
-               subprocess.run(C.ssh(c["addr"]) + [f"cat {path}"],
+               subprocess.run(C.remote(c["addr"], f"cat {path}"),
                               capture_output=True, text=True, check=True).stdout)
         drv[c["host"]] = json.loads(txt)
         (out / f"driver-{c['host']}.json").write_text(txt)

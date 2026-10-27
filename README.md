@@ -73,8 +73,8 @@ replay 는 실행마다 이 장비의 `driver.py` 를 다른 클라이언트의 
 1. 가져갈 것: 이 저장소, 공개 trace, 클라이언트마다 LMCache 빌드
    - trace: `git clone https://github.com/alibaba-edu/qwen-bailian-usagetraces-anon traces/alibaba` (Git LFS). Mooncake trace 는 Mooncake 저장소의 `FAST25-release/traces` 를 `traces/mooncake/` 에 둔다(sweep 은 Alibaba 만 쓴다)
    - LMCache: 그 클러스터의 3FS 라이브러리(`libhf3fs_api_shared`)로 hf3fs 확장을 빌드해 `$HOME/venv-lmcache-hf3fs` · `$HOME/LMCache-hf3fs-atomic` 처럼 `tune/tune.py` 의 `VERSIONS` 가 가리키는 이름으로 둔다. 클라이언트마다 같은 빌드여야 한다(replay 가 지문으로 견준다)
-2. `cp clusters/TEMPLATE.toml clusters/<이름>.toml` 하고 `[access]` 와 `threefs.admin_cli` · `admin_host` 를 채운다. 비밀번호는 파일 경로만 적는다(권한 600, 저장소 밖)
-3. `SM_CLUSTER=<이름> python3 cluster.py discover <이름>` — admin_cli(`list-nodes` · `list-clients` · `list-chains` · FUSE 템플릿 · storage 설정)와 각 노드(RDMA NIC · NVMe · 마운트)에서 찾은 값으로 초안을 다시 내고, 지금 FUSE 템플릿을 되돌릴 곳으로 받아 둔다
+2. `cp clusters/TEMPLATE.toml clusters/<이름>.toml` 하고 `[access]` 를 채운다. 비밀번호는 파일 경로만 적는다(권한 600, 저장소 밖). 원격에서 돌릴 계정이 ssh 계정과 다르면 `runs_as`
+3. `SM_CLUSTER=<이름> python3 cluster.py discover <이름>` — admin_cli(`list-nodes` · `list-clients` · `list-chains` · FUSE 템플릿 · storage 설정)와 각 노드(RDMA 포트가 ACTIVE 인 NIC · NVMe · 마운트 · python · 도구 사본 · FUSE 서비스와 로그)에서 찾은 값으로 초안을 다시 내고, 지금 FUSE 템플릿을 되돌릴 곳으로 받아 둔다. admin_cli · admin_host 가 비어 있으면 3FS 기본 설치 경로와 이 장비로 해 본다
 4. 초안의 빈칸과 `# 확인` 을 사람이 채운다. `[allow]` 는 클러스터 주인에게 묻는다. 천장은 사양값으로 시작해도 되고, 그때는 그렇게 적어 둔다
 5. `python3 cluster.py check` 가 "통과", `python3 tune/settings.py home` 이 "HOME 과 같다"
 6. `python3 tune/tune.py sweep a --trace coder --start 0.10` 처럼 돌린다. 허락이 없는 쪽을 바꾸는 설정은 건너뛰고, 기준도 그쪽은 지금 값으로 둔다

@@ -5,12 +5,12 @@
 NVMe(/proc/diskstats), RDMA 포트 카운터(counters + hw_counters), NIC ethtool -S.
 해석(델타 계산)은 hw_probe.py 가 한다.
 
-    python3 hw_sampler.py <초> <RDMA NIC,...>       NIC 가 여럿이면 카운터를 더한다(노드 하나의 합)
+    python3 hw_sampler.py <초> <RDMA NIC,...> [NVMe,...]   NIC 가 여럿이면 카운터를 더한다(노드 하나의 합).
+                                                       NVMe 는 3FS target 이 든 장치만(nvme0n1 꼴, 없으면 - 또는 생략 — 디스크를 재지 않는다)
 """
 
 import json
 import os
-import re
 import subprocess
 import sys
 import time
@@ -49,12 +49,14 @@ def procs():
     return out
 
 
-def disk():
-    """NVMe 장치 전체(파티션 제외)의 합. storage 노드는 NVMe 가 2개다 (2026-10-01 부터)."""
+def disk(devs):
+    """주어진 NVMe 장치(3FS target 이 든 것)의 합. OS 디스크 등은 세지 않는다"""
+    if not devs:
+        return None
     out = {"sect_r": 0, "sect_w": 0, "io_ticks": 0, "weighted": 0, "n": 0}
     for line in open("/proc/diskstats"):
         f = line.split()
-        if re.fullmatch(r"nvme\d+n\d+", f[2]):
+        if f[2] in devs:
             for k, i in (("sect_r", 5), ("sect_w", 9), ("io_ticks", 12), ("weighted", 13)):
                 out[k] += int(f[i])
             out["n"] += 1
@@ -94,12 +96,13 @@ def main():
     seconds = float(sys.argv[1])
     nd = sys.argv[2].split(",")
     ib = [ibdev(x) for x in nd]
+    devs = set() if len(sys.argv) < 4 or sys.argv[3] == "-" else set(sys.argv[3].split(","))
     print(json.dumps({"host": os.uname().nodename, "netdev": ",".join(nd), "ibdev": ",".join(ib),
                       "hz": os.sysconf("SC_CLK_TCK"), "ncpu": os.cpu_count()}), flush=True)
     end = time.time() + seconds
     nxt = time.time()
     while time.time() < end:
-        print(json.dumps({"t": time.time(), "cpu": cpu(), "proc": procs(), "disk": disk(),
+        print(json.dumps({"t": time.time(), "cpu": cpu(), "proc": procs(), "disk": disk(devs),
                           "rdma": rdma(ib), "eth": ethtool(nd)}), flush=True)
         nxt += 1.0
         time.sleep(max(0, nxt - time.time()))

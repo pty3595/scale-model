@@ -81,7 +81,7 @@ def knob(v, nd=16):
 def data_dir(stripe, nd=16, wm=""):
     d = f"{T.DATA}/screen{wm}-s{stripe}"
     for x in [d] + ([f"{d}/p{i}" for i in range(nd)] if nd > 1 else []):
-        ensure_layout(x, stripe, 1048576)
+        ensure_layout(x, stripe, T.CHUNK)
     lay = {l.split()[0]: l.split()[-1] for l in admin(f"stat --display-layout {T.C.rel(d)}").splitlines()
            if l.startswith("Layout-")}
     if lay.get("Layout-StripeSize") != str(stripe):
@@ -90,6 +90,16 @@ def data_dir(stripe, nd=16, wm=""):
 
 
 set_st, set_cr, CR_DEFAULT = S.set_st, S.set_cr, S.CR_HOME     # storage RDMA 동시 수 · 읽기 coroutine(settings.py)
+
+
+def skip(v):
+    """이 클러스터에서 뜻이 없는 후보 — 복제가 하나면 읽기 대상 고르기가 없다. stripe 는 chain 수 · 기본값과 견준다"""
+    m = T.C.C["measured"]
+    if "tsel" in v.get("fuse", {}) and m["replicas"] == 1:
+        return "복제가 하나라 읽기 대상(tsel)을 고를 것이 없다"
+    if "stripe" in v and (v["stripe"] > m["chains"] or v["stripe"] == m["default_stripe"]):
+        return f"stripe {v['stripe']} 는 chain {m['chains']}개 · 기본 stripe {m['default_stripe']} 에서 뜻이 없다"
+    return None
 
 
 class Screen(T.Sweep):
@@ -183,10 +193,14 @@ def main():
                 S.apply({**S.BASE, **v.get("fuse", {})})
                 for lv in (float(x) for x in args.repeat.split(",")):
                     for k in range(args.rep_start, args.rep_start + args.times):
-                        m = sc.measure(f"rep{k}-{name}", knob(v, v.get("nd", nd)), data_dir(v.get("stripe", 8), v.get("nd", nd), sc.wm), lv)
+                        m = sc.measure(f"rep{k}-{name}", knob(v, v.get("nd", nd)), data_dir(v.get("stripe", T.STRIPE), v.get("nd", nd), sc.wm), lv)
                         summary.setdefault(f"{name} {lv:.2f}", []).append(m["ok"])
             S.log(f"   다시 돌리기: {summary}")
         for name, v in ([] if args.repeat else cands):
+            why = skip(v)
+            if why:
+                S.log(f"   {name}: {why} — 건너뛴다")
+                continue
             try:
                 if "st" in v or "cr" in v:
                     set_st(**{**ST_DEFAULT, **v.get("st", {})})
@@ -195,7 +209,7 @@ def main():
             except S.NotAllowed as e:
                 S.log(f"   {name}: {e} 을 바꿀 허락이 없어 건너뛴다")
                 continue
-            best, verdict = sc.screen(name, knob(v, v.get("nd", nd)), data_dir(v.get("stripe", 8), v.get("nd", nd), sc.wm), base_lv)
+            best, verdict = sc.screen(name, knob(v, v.get("nd", nd)), data_dir(v.get("stripe", T.STRIPE), v.get("nd", nd), sc.wm), base_lv)
             summary[name] = {"best": best, "verdict": verdict}
             if "st" in v or "cr" in v:
                 set_st(**ST_DEFAULT)

@@ -156,12 +156,16 @@ def sweep(base: dict, cal: dict, levels: list[str]) -> list[dict]:
     one = at_speed(base, 1.0, cal)
     if one["load_gibps"] <= 0:
         raise SystemExit("이 구간은 3FS load 가 없다. 다른 구간을 고른다.")
-    load_wall, store_wall = cal["client_wall"]["paced_gibps"], cal["store_wall"]["overlap_gibps"]
+    inf = float("inf")      # 클러스터 설정에 클라이언트 한계가 없으면(None) 자르지 않는다
+    load_wall, store_wall = cal["client_wall"]["paced_gibps"] or inf, cal["store_wall"]["overlap_gibps"] or inf
     ld1, st1 = max(one["client_gibps"]["load"]), max(one["client_gibps"]["store"])   # 가장 바쁜 클라이언트, 1배속
-    max_speed = min(load_wall / ld1, store_wall / st1 if st1 else float("inf"))
+    max_speed = min(load_wall / ld1, store_wall / st1 if st1 else inf)
     out = []
     for lv in levels:
         if lv == "max":
+            if max_speed == inf:
+                out.append({"level": lv, "skipped": "클라이언트 한계를 모른다 — [measured] client_load_wall_gibps · client_store_wall_gibps 나 --load-wall · --store-wall"})
+                continue
             speed = max_speed
         else:
             speed = float(lv) * util_ceilings(cal)["disk_read"] / one["load_gibps"]

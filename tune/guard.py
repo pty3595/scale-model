@@ -44,7 +44,7 @@ def busy():
     src, why = Path(__file__).read_text(), []
     for c in C.CLIENTS:
         a = C.addr(c["host"])
-        r = subprocess.run(["python3", "-"] if a is None else C.ssh(a) + ["python3 -"], input=src, capture_output=True, text=True, check=True)
+        r = subprocess.run(C.remote(a, "python3 -"), input=src, capture_output=True, text=True, check=True)
         g = json.loads(r.stdout)
         if g["servers"] or g["ray"] or g["gpu_apps"]:
             why.append(json.dumps(g))
