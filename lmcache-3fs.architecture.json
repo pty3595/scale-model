@@ -1,0 +1,411 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "LMCache에서 3FS로 가는 경로",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "ours",
+        "label": "우리가 쓴 경로",
+        "focus": [
+          "mp",
+          "dyn",
+          "nixl",
+          "usrbio",
+          "fuse",
+          "cluster"
+        ],
+        "note": "MP 서버의 nixl_store_dynamic adapter가 NIXL HF3FS plugin으로 USRBIO를 쓴다. 파일 생성·rename·stat은 마운트를 거쳐 meta 서버로 간다."
+      },
+      {
+        "id": "native",
+        "label": "nixl_native (upstream)",
+        "focus": [
+          "mp",
+          "native",
+          "nixl",
+          "usrbio",
+          "fuse",
+          "cluster"
+        ],
+        "note": "2026-09-18 머지된 C++ adapter. backend가 HF3FS면 같은 plugin을, POSIX면 FUSE 마운트를 쓴다. HF3FS 조합은 upstream도 우리도 검증하지 않았다."
+      },
+      {
+        "id": "fuse-only",
+        "label": "FUSE만 쓰는 경로",
+        "focus": [
+          "mp",
+          "fs",
+          "ip_fuse",
+          "fuse",
+          "cluster"
+        ],
+        "note": "fs·fs_native adapter와 in-process fs:// 는 데이터도 FUSE 마운트로 읽고 쓴다."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "mp",
+      "type": "backend",
+      "label": "LMCache MP server",
+      "sublabel": "L1 = CPU DRAM",
+      "tag": "--l2-adapter",
+      "pos": [
+        470,
+        50
+      ],
+      "size": [
+        200,
+        64
+      ]
+    },
+    {
+      "id": "dyn",
+      "type": "backend",
+      "label": "nixl_store_dynamic",
+      "sublabel": "key마다 파일 · Python",
+      "tag": "설치본 · 우리가 씀",
+      "pos": [
+        260,
+        210
+      ],
+      "size": [
+        180,
+        64
+      ]
+    },
+    {
+      "id": "static",
+      "type": "backend",
+      "label": "nixl_store",
+      "sublabel": "미리 만든 파일 슬롯 재사용",
+      "tag": "설치본",
+      "pos": [
+        480,
+        210
+      ],
+      "size": [
+        180,
+        64
+      ]
+    },
+    {
+      "id": "pr",
+      "type": "external",
+      "label": "hf3fs adapter",
+      "sublabel": "C++ USRBIO 직접",
+      "tag": "PR #5131 · 미머지",
+      "pos": [
+        40,
+        210
+      ],
+      "size": [
+        180,
+        64
+      ]
+    },
+    {
+      "id": "native",
+      "type": "external",
+      "label": "nixl_native",
+      "sublabel": "C++ · worker 4개",
+      "tag": "upstream 09-18 · 미설치",
+      "pos": [
+        700,
+        210
+      ],
+      "size": [
+        180,
+        64
+      ]
+    },
+    {
+      "id": "fs",
+      "type": "backend",
+      "label": "fs · fs_native",
+      "sublabel": "파일시스템 일반",
+      "tag": "설치본",
+      "pos": [
+        920,
+        210
+      ],
+      "size": [
+        180,
+        64
+      ]
+    },
+    {
+      "id": "ip_usrbio",
+      "type": "backend",
+      "label": "in-process hf3fs",
+      "sublabel": "remote plugin · NixlStorageBackend",
+      "tag": "in-process 모드 · deprecated",
+      "pos": [
+        150,
+        690
+      ],
+      "size": [
+        220,
+        64
+      ]
+    },
+    {
+      "id": "ip_fuse",
+      "type": "backend",
+      "label": "in-process fs://",
+      "sublabel": "local disk backend",
+      "tag": "in-process 모드 · deprecated",
+      "pos": [
+        980,
+        690
+      ],
+      "size": [
+        220,
+        64
+      ]
+    },
+    {
+      "id": "nixl",
+      "type": "backend",
+      "label": "NIXL HF3FS plugin",
+      "sublabel": "mem_config dram / dram_zc",
+      "pos": [
+        360,
+        370
+      ],
+      "size": [
+        200,
+        64
+      ]
+    },
+    {
+      "id": "usrbio",
+      "type": "backend",
+      "label": "3FS USRBIO",
+      "sublabel": "IOV · IOR 공유 메모리",
+      "pos": [
+        180,
+        530
+      ],
+      "size": [
+        220,
+        64
+      ]
+    },
+    {
+      "id": "fuse",
+      "type": "backend",
+      "label": "3FS FUSE 마운트",
+      "sublabel": "/3fs",
+      "pos": [
+        900,
+        530
+      ],
+      "size": [
+        220,
+        64
+      ]
+    },
+    {
+      "id": "cluster",
+      "type": "database",
+      "label": "3FS 클러스터",
+      "sublabel": "meta · storage",
+      "pos": [
+        540,
+        690
+      ],
+      "size": [
+        220,
+        64
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "MP 모드 L2 adapter",
+      "wraps": [
+        "pr",
+        "dyn",
+        "static",
+        "native",
+        "fs"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "mp-dyn",
+      "from": "mp",
+      "to": "dyn",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "mp-static",
+      "from": "mp",
+      "to": "static",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "mp-pr",
+      "from": "mp",
+      "to": "pr",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "mp-native",
+      "from": "mp",
+      "to": "native",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "mp-fs",
+      "from": "mp",
+      "to": "fs",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "dyn-nixl",
+      "from": "dyn",
+      "to": "nixl",
+      "label": "HF3FS",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "static-nixl",
+      "from": "static",
+      "to": "nixl",
+      "label": "HF3FS",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "native-nixl",
+      "from": "native",
+      "to": "nixl",
+      "label": "HF3FS (미검증)",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "right"
+    },
+    {
+      "id": "native-fuse",
+      "from": "native",
+      "to": "fuse",
+      "label": "POSIX",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "pr-usrbio",
+      "from": "pr",
+      "to": "usrbio",
+      "label": "hf3fs API",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "fs-fuse",
+      "from": "fs",
+      "to": "fuse",
+      "label": "read · write",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 24
+    },
+    {
+      "id": "ip-usrbio",
+      "from": "ip_usrbio",
+      "to": "usrbio",
+      "label": "hf3fs_fuse.io · NIXL",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "ip-fuse",
+      "from": "ip_fuse",
+      "to": "fuse",
+      "label": "read · write",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "nixl-usrbio",
+      "from": "nixl",
+      "to": "usrbio",
+      "label": "IOV 복사 · IOR 제출",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "right"
+    },
+    {
+      "id": "usrbio-fuse",
+      "from": "usrbio",
+      "to": "fuse",
+      "label": "fd 열기 · rename · stat",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "usrbio-cluster",
+      "from": "usrbio",
+      "to": "cluster",
+      "label": "데이터 RDMA",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "left"
+    },
+    {
+      "id": "fuse-cluster",
+      "from": "fuse",
+      "to": "cluster",
+      "label": "메타데이터 · FUSE IO",
+      "fromSide": "bottom",
+      "toSide": "right"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "우리가 쓴 경로",
+      "items": [
+        "nixl_store_dynamic → NIXL HF3FS → USRBIO",
+        "파일 연산이 Python event loop에서 하나씩 — store object당 약 40 ms",
+        "여러 노드가 한 폴더를 공유하고 os.stat으로 서로 찾는다"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "nixl_native (upstream 2026-09-18)",
+      "items": [
+        "C++ worker 4개가 각자 NIXL agent · L1 전체를 한 번 등록",
+        "HF3FS plugin은 경로 등록(FILE_SEG)을 지원 — 조합은 미검증",
+        "한 file_path에 여러 프로세스 쓰기 금지 → 노드 공유와 충돌"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "USRBIO여도 메타데이터는 마운트로",
+      "items": [
+        "데이터만 USRBIO로 storage에 RDMA",
+        "파일 생성 · rename · stat은 FUSE 마운트 → meta 서버",
+        "fs · fs_native · POSIX는 데이터도 FUSE"
+      ]
+    }
+  ]
+}

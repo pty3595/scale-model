@@ -1,0 +1,223 @@
+{
+  "_comment": "소프트웨어의 성질(object 모양 · adapter)과 PoC 클러스터에서 실측한 기록. 추정값을 넣지 않는다. 클러스터마다 다른 값(클라이언트 · 천장 · 복제 · layout · 마운트)은 cluster.py 가 clusters/<이름>.toml 로 덮어 쓴다",
+  "cluster": "hf3fs-spark3-storage1234-spark4",
+  "measured_on": "2026-10-01",
+  "storage_nodes": 4,
+  "ceilings_gibps": {
+    "nvme_one": {
+      "value": 3.387,
+      "source_gbps": 3.637,
+      "how": "XFS 위 별도 폴더의 파일을 O_DIRECT dd bs=1M 로 읽기, 스트림 4(2에서 98%). data1 3.382 · data2 3.392 GiB/s. 2026-10-01, results/ceiling-20261001",
+      "method_change": "2026-09 값 3.436 은 raw 장치 읽기였다. 새 디스크는 거의 비어 있어 raw 로 읽으면 쓰이지 않은 영역을 읽게 되므로, 쓰기 시험에서 만든 파일을 읽는 방식으로 바꿨다",
+      "provisional": false
+    },
+    "nvme_total": {
+      "value": 27.038,
+      "source_gbps": 29.032,
+      "how": "NVMe 8개(노드당 2개) 동시 읽기 합계, 장치당 스트림 4, 60초. 노드 하나 6.67~6.82 GiB/s = 1개의 2배이고 네 대 동시도 선형 — Proxmox 호스트 경합 없음. 2026-10-01, results/ceiling-20261001",
+      "provisional": false
+    },
+    "client_roce_port": {
+      "value": 10.282,
+      "source_gbps": 11.04,
+      "how": "raw RDMA. 100 GbE의 88%",
+      "provisional": false
+    },
+    "client_link_line": {
+      "value": 11.641532182693481,
+      "source_gbit": 100,
+      "how": "클라이언트 RoCE 포트의 선로 속도(100 GbE). 세 클라이언트 모두 enp1s0f0np0/rocep1s0f0",
+      "provisional": false
+    },
+    "read_path": {
+      "value": 7.665,
+      "source_gbps": 8.23,
+      "how": "fio-usrbio, bs 1 MiB · iodepth 32 · numjobs 32 · direct, 1 GiB 파일 50개, spark4 단독. 48 job 8.32, 64 job 8.04, 96 job 7.00 GB/s. 재전송 0. 2026-10-01, results/ceiling-20261001",
+      "three_clients_gibps": 19.6,
+      "three_clients_how": "세 대 동시 32 job 씩: 7.13 · 6.95 · 6.97 GB/s, 합계 21.05 GB/s(read admission 12/3). 디스크 읽기 천장의 72% 에서 멈춘 것은 admission 12/3 이 동시 발행을 묶어서다 — 32/8 이면 26.2 GB/s(24.4 GiB/s, 손실 없음). results/adm-rts-20261002",
+      "provisional": false,
+      "note": "U 의 분모가 아니다 — 분모는 nvme_total(물리)이다. USRBIO 는 다른 계정이 만든 644 파일을 등록하지 못한다(EBADF) — 시험 파일은 666 으로 둔다",
+      "three_clients_admission_32_8_gibps": 24.43
+    },
+    "nvme_write_one": {
+      "value": 3.33,
+      "source_gbps": 3.577,
+      "how": "XFS 위 별도 폴더에 O_DIRECT 난수 dd bs=1M, 스트림 4. data1 3.308 · data2 3.355 GiB/s. 2026-10-01, results/ceiling-20261001",
+      "provisional": false
+    },
+    "nvme_write_total": {
+      "value": 26.589,
+      "source_gbps": 28.552,
+      "how": "NVMe 8개 동시 쓰기 합계, 장치당 스트림 4, 60초. 노드마다 6.65 GiB/s 로 같다. 2026-10-01, results/ceiling-20261001",
+      "provisional": false
+    }
+  },
+  "shape": {
+    "_comment": "실행 트레이스 7,054건에서 뽑은 대푯값. 소프트웨어의 성질이라 장비를 타지 않는다.",
+    "object_bytes": 41943040,
+    "data_size_kb": 40960,
+    "l1_align_bytes": 8388608,
+    "store_num_keys": 8,
+    "load_num_keys": 156,
+    "model": "Qwen3-14B, 토큰 256개 분량의 KV"
+  },
+  "adapter": {
+    "type": "nixl_store_dynamic",
+    "backend": "HF3FS",
+    "backend_params": {
+      "use_direct_io": "true",
+      "mount_point": "/3fs/3fs",
+      "mem_config": "dram",
+      "iopool_size": "64",
+      "max_capacity_gb": "512"
+    },
+    "env": {
+      "NIXL_PLUGIN_DIR": "{venv}/lib/python3.12/site-packages/.nixl_cu13.mesonpy.libs/plugins",
+      "LD_LIBRARY_PATH": "{venv}/lib/python3.12/site-packages/.nixl_cu13.mesonpy.libs"
+    },
+    "env_why": "cu12 플러그인 디렉터리에는 HF3FS가 없다. 플러그인의 RUNPATH가 빌드 트리를 가리켜 LD_LIBRARY_PATH로 보정해야 한다."
+  },
+  "operating_points": [
+    {
+      "op": "load",
+      "num_keys": 156,
+      "in_flight": 1,
+      "gibps": 2.995,
+      "shape_matches_production": true,
+      "how": "align 8 MiB · 40 MiB 객체 · direct_io · iopool 64 · 데이터셋 1,248 key(48.75 GiB) · rounds 3 + warmup 1 · load 앞에 lookup 으로 index 를 채움"
+    },
+    {
+      "op": "store",
+      "num_keys": 8,
+      "in_flight": 1,
+      "gibps": 0.448,
+      "shape_matches_production": true,
+      "how": "위와 같은 설정"
+    }
+  ],
+  "unmatched_axes": [
+    "절대 지연 — RDMA가 커널을 우회해 지연을 주입할 수단이 없다. 우리 지연은 하한으로만 쓴다",
+    "연산당 고정비와 metadata plane — 적용 범위를 chunk 16 MiB 이상으로 한정해 덮는다",
+    "장애 거동 — storage 4대가 단일 Proxmox 호스트 위의 VM이라 3FS 레벨 복제로 막을 수 없다",
+    "꼬리 지연 — 노드 수를 줄이면 낙관적으로 나온다",
+    "연산과 스토리지가 겹치며 생기는 효과 — 추론 엔진 없이 adapter만 구동하므로 빠진다",
+    "클라이언트 링크의 선로 부하 — Uc 는 payload 기준으로 맞춘다. 우리 adapter 경로는 선로에 payload 의 1.22배(2대)·1.29배(3대)를 싣는다(2026-09-23). fio-usrbio 는 1.07배라 헤더(MTU 1024) 외 초과분은 재전송으로 보이며, 대상 클러스터의 선로 오버헤드는 알 수 없다",
+    "네트워크의 손실 여부 — 이 클러스터는 PFC 가 꺼진 손실 이더넷이라 여러 대가 한 곳으로 몰리면(incast) 처리량이 무너진다. 대상이 무손실(PFC)이면 혼잡·재전송이 걸린 결과(읽기 admission 효과 등)는 옮겨지지 않는다"
+  ],
+  "client_wall": {
+    "_comment": "클라이언트 한 대가 adapter 경로로 낼 수 있는 양. gate 실험(2026-09-22)에서 어느 다이얼에도 반응하지 않았다.",
+    "gibps": 2.77,
+    "scope": "클라이언트 한 대 전체. 프로세스를 늘려도 합계가 그대로이고 정확히 1/N 로 갈린다.",
+    "invariant_to": {
+      "in_flight": {
+        "1": 2.995,
+        "2": 3.095,
+        "4": 3.087
+      },
+      "processes_total": {
+        "1": 2.923,
+        "2": 2.912,
+        "3": 2.859
+      },
+      "num_keys": {
+        "4": 3.14,
+        "16": 2.903,
+        "156": 2.995
+      },
+      "object_mib": {
+        "40": 2.903,
+        "80": 3.074,
+        "160": 3.04
+      },
+      "l1_align_bytes": {
+        "4096": 2.659,
+        "1048576": 3.088,
+        "8388608": 3.067
+      },
+      "iopool_size": {
+        "64": 2.95,
+        "128": 2.906,
+        "256": 3.064,
+        "512": 2.79
+      }
+    },
+    "not_cpu": "CPU 사용률은 97%까지 차지만 벽의 원인은 아니다(2026-09-23). NIXL HF3FS plugin 이 요청마다 띄우는 단명 스레드(waitForIOsThread, sched_yield)가 IO 완료를 기다리며 코어를 태운다. taskset 으로 코어를 20/10/5 개로 줄여도 2.98/3.32/2.98 GiB/s 로 같다. 2026-09-22 의 '부하 중 driver 0%' 는 살아 있는 스레드만 세어 단명 스레드를 놓친 값이다.",
+    "not_admission": "같은 클라이언트·같은 admission(12/3)·같은 파일에서 fio-usrbio 가 6.97 GiB/s 를 낸다. adapter 경로만 2.3배 낮다.",
+    "cause": "NIXL HF3FS plugin(v1.4.1)의 mem_config=dram 경로 — 객체마다 IOV 생성 + 완료 후 memcpy. dram_zc 는 복사가 없지만 2 GiB 넘는 버퍼 등록이 pwrite 짧은 쓰기로 실패하는 plugin 버그 때문에 쓸 수 없다. 1.875 GiB 버퍼에서 dram 3.06 → dram_zc 5.37 GiB/s. 3대 dram_zc 에서는 storage NVMe(util 90%)가 한계. results/hw-limits-20260923/NOTE.md",
+    "paced_gibps": 2.332,
+    "paced_how": "시각표를 지키며 쏠 수 있는 대당 상한. 2026-09-23 U 스윕(spark4 한 대, 156키 load + 적중률 78% lookup, 60초)에서 2.332 GiB/s(U 0.17)는 늦은 라운드 0, 2.469(U 0.18)는 늦은 라운드 13(평균은 유지), 2.744(U 0.20)는 27회에 실측 -5%. 라운드마다 lookup 이 120~200 ms 들고 load 자체도 2.5~2.8 GiB/s 라 제한 없는 벽 3.0 보다 낮다.",
+    "measured_2026_10_01": {
+      "how": "driver calibrate --op load, 156키 x 40 MiB, in_flight 1, 8라운드, LMCache 8d7d2c4",
+      "spark4": [
+        2.776,
+        2.76
+      ],
+      "spark1": 2.756,
+      "spark4_stripe4_dir": 2.881,
+      "reading": "stripe 8(새 기본)이 stripe 4 보다 4% 낮다. 2026-09 값 3.0 과의 나머지 차이 4% 는 LMCache 버전 차이이거나 잡음"
+    },
+    "_history": "invariant_to · not_cpu · not_admission · cause 는 2026-09-22~23, LMCache a44d5e5 · 옛 구성(NVMe 4개)에서 잰 것이다",
+    "paced_provisional": "paced_gibps 2.332 는 옛 구성 · a44d5e5 에서 잰 값이다. 새 벽(2.77)에 맞춰 sweep 전에 다시 잰다",
+    "three_clients_unlimited_2026_10_02": {
+      "dram": 2.43,
+      "dram_zc_48keys": 3.62,
+      "how": "hw_probe 3대 동시 제한 없이, 대당 GiB/s. 예전 구성 dram 2.62 · dram_zc 4.31. 망 재전송이 늘어 낮아졌다(fabric.loss_2026_10_02)"
+    }
+  },
+  "read_admission": {
+    "_comment": "클라이언트의 FUSE 설정. 프로세스 전체가 공유한다. 측정마다 이 값을 기록한다.",
+    "file": "spark4 의 /opt/3fs/etc/hf3fs_fuse_main.toml, [storage.traffic_control.read]",
+    "max_concurrent_requests": 12,
+    "max_concurrent_requests_per_server": 3,
+    "max_batch_bytes": "4MB",
+    "max_batch_size": 128
+  },
+  "util_denominator": {
+    "_comment": "사용률 = 노드(또는 링크) 하나가 받는 부하 ÷ 물리 천장. 분모는 3FS 설정이 아니라 물리 천장이라, 3FS 설정(read admission 등)을 바꿔도 같은 plan 이 같은 부하를 건다. 링크는 선로 속도로 나눈다.",
+    "disk_read": "nvme_total",
+    "disk_write": "nvme_write_total",
+    "link": "client_link_line"
+  },
+  "replicas": {
+    "value": 2,
+    "how": "admin_cli list-chains — chain 8개 모두 target 2개(SERVING-UPTODATE, PreferredOrder 와 같은 순서). 디스크에 쓰이는 양 = 클라이언트가 쓴 양 x 2. 2026-10-01"
+  },
+  "store_wall": {
+    "_comment": "클라이언트 한 대가 adapter store 경로로 낼 수 있는 양(payload). load 와 따로 잰다.",
+    "gibps": 0.62,
+    "how": "driver calibrate --op store, 8키 x 40 MiB, in_flight 1 (2026-09-22). open·rename 이 섞인 경로",
+    "paced_gibps": 0.35,
+    "paced_how": "2026-09-23 store 스윕(spark4 한 대, 8키 x 40 MiB, 60초, 매 라운드 새 key): 대당 0.30·0.35 늦은 라운드 0, 0.40 늦은 라운드 76(평균 유지 +1.3%), 0.43 은 실측 -8.9%. 디스크 쓰기 = payload x 2.04 (복제 2 + 메타데이터 약 2%)",
+    "overlap_gibps": 0.42,
+    "overlap_how": "store 를 기다리지 않고 겹쳐 보낼 때(실제 LMCache, 2026-09-29 이후 replay) 가장 바쁜 클라이언트가 따라가는 store. coder sweep(load 와 섞임): 0.42 못 찾은 load 0 · store 묶음 p99 8 초, 0.52 못 찾은 load 13, 0.61 은 47, 0.62 에서 포화(시작 지연 38 초). store 만 따로 잰 dram in_flight 2·4 = 0.607·0.621 과 포화점이 같다. results/coder-sweep2-20260929/NOTE.md. paced_gibps 는 store 를 하나씩 기다리던 옛 replay 의 값",
+    "measured_2026_10_01": {
+      "how": "driver calibrate --op store, 8키 x 40 MiB, in_flight 1, 8라운드, LMCache 8d7d2c4",
+      "spark4": 0.589,
+      "spark1": 0.65,
+      "reading": "a44d5e5 의 0.446 보다 높다 — #5170 이 묶음 안 chunk 를 동시에 쓴다. 대신 같은 노드의 load 를 늦춘다(results/lmcache-dev-20261001/NOTE.md)"
+    },
+    "overlap_rechecked": "2026-10-02 새 구성 · LMCache dev 로 coder sweep 다시: 가장 바쁜 클라이언트 store 0.42(read0.10) 는 못 찾은 load 0, 0.52(read0.12) 31, 0.61(read0.15) 41, 포화 169 — overlap_gibps 0.42 그대로. paced_gibps 0.35 는 옛 replay 값(쓰지 않음). results/refresh-20261001"
+  },
+  "layout": {
+    "_comment": "3FS 파일 layout. 디렉터리마다 admin_cli set-layout 으로 stripe 를 바꿀 수 있다(클러스터 설정이 아니다).",
+    "chains": 8,
+    "chunk_bytes": 1048576,
+    "default_stripe": 8,
+    "how": "admin_cli stat --display-layout: / 와 새 폴더 모두 chunk 1 MiB, stripe 8, chain table 1 (chain 8개, 노드당 target 4개). 2026-10-01"
+  },
+  "fabric": {
+    "lossless": false,
+    "how": "모든 NIC(ConnectX-7 클라이언트, ConnectX-6 Dx storage PF 패스스루)에서 PFC 0~7 전부 off, trust pcp(VLAN 없음 → 전부 prio 0), link-level pause RX/TX on. 스위치 설정은 미확인. 2026-09-24",
+    "evidence": "ib_write_bw 로 storage1 한 대에 몰아 쏠 때 1대 92.6 Gb/s(손실 0), 2대 합계 48 Gb/s, 3대 합계 4.9 Gb/s. 받는 쪽 out_of_sequence 수만 건 — 스위치에서 버려지고 go-back-N 재전송이 선로를 채운다. results/hw-limits-20260923/",
+    "rechecked": "2026-10-01 3FS 재구성 뒤 다시 봤다: 8개 포트 모두 100G, PFC 0~7 off, TC 송신 상한 없음",
+    "link_speed_change": "2026-10-01 spark4 에서 autoneg 로 50/40/25G 만 내세우면 스위치가 받지 않아 링크가 붙지 않는다. 스위치 포트 속도를 고정해야 한다(접근 필요). results/linkspeed-20261001/NOTE.md",
+    "loss_2026_10_02": "새 구성(노드당 NVMe 2 · chain 8 · stripe 8)에서 3대 제한 없는 load 의 손실이 늘었다 — dram_zc 처리량 12.94 → 10.87 GiB/s, 선로 ÷ 디스크 1.19 → 3.24, 클라이언트 out_of_sequence 49 → 971 /GiB. 원인: storage 노드가 디스크 2개로 쉬는 틈 없이 보낸다. storage 송신만 30G 로 늦추면(throttle.sh net 100 30) 12.89 GiB/s · 1.06 · 1 /GiB 로 돌아온다. stripe 4 는 증가분의 절반쯤을 줄인다. 디스크 상한(io.max)은 순간 속도를 늦추지 못해 효과가 없다. results/refresh-20261001/NOTE.md",
+    "request_to_send_2026_10_02": "3FS RDMA control(request-to-send)을 켜면 3대 제한 없는 dram_zc load 10.89 → 22.5 GiB/s, 선로 ÷ 디스크 3.31 → 1.16, OOS 970 → 20~50 /GiB, 합성 load request 당 시간 0.90 배. 동시 허락 수(64 · 16 · 4 · 2)와 무관. 클러스터 기본은 꺼짐(실험 뒤 되돌림). results/rts-20261002/NOTE.md"
+  },
+  "storage_change": "2026-10-01 storage 노드마다 NVMe 를 하나 더 붙이고(노드당 2개, 8개 모두 PCIe Gen3 x4) 3FS 를 새로 만들었다 — chain 8개, 기본 stripe 8. 그 전 값(노드당 NVMe 1개, chain 4개)으로 잰 결과는 이 파일과 맞지 않는다",
+  "lmcache": {
+    "commit": "8d7d2c4",
+    "version": "0.5.6rc3.dev27",
+    "note": "2026-10-01 최신 dev 로 올렸다(#5170 포함). 2026-09-30 까지의 측정은 a44d5e5"
+  }
+}

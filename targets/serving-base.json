@@ -1,0 +1,13 @@
+{
+  "name": "LMCache MP 기본 서빙 설정 — 시뮬레이터 검증 기준",
+  "_note": "Spark 한 대에서 실제 엔진과 비교할 수 있는 범위의 기본값 위주 설정. 캐시 규칙 검증용이라 요청은 한 건씩, store 가 끝나면 다음",
+  "model": {"name": "Qwen/Qwen3-14B", "dtype": "bfloat16", "kv_bytes_per_token": 163840, "max_model_len": 40960},
+  "vllm": {"enable_prefix_caching": true, "block_size": 16, "kv_cache_memory_bytes": 25769803776,
+           "max_num_seqs": 1, "max_num_batched_tokens": 8192},
+  "lmcache": {"mode": "mp", "chunk_size": 256, "l1_size_gb": 32, "eviction_policy": "LRU",
+              "eviction_trigger_watermark": 0.8, "eviction_ratio": 0.2, "l2_store_policy": "default",
+              "l1_align_bytes": 4096, "hash_algorithm": "blake3"},
+  "l2": {"type": "nixl_store_dynamic", "backend": "HF3FS", "mem_config": "dram", "max_capacity_gb": 2048,
+         "ttl": "infinite"},
+  "requests": {"prompt": "hash_ids 블록마다 고정 16토큰", "max_tokens": 1, "concurrency": 1, "drain_store_between": true}
+}

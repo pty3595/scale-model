@@ -1,0 +1,19 @@
+__pycache__/
+results/
+plans/
+plan-*.json
+traces/
+*.visual-check.json
+tune/*.out
+tune/*.log
+tune/*.pid
+tune/st-*.toml
+tune/deadline
+# 클러스터마다의 값과 결과 — 그 클러스터에만 둔다
+clusters/*
+!clusters/TEMPLATE.toml
+tune/KNOBS.md
+tune/*.sh
+HANDOFF.md
+validate/*
+!validate/clean_iov.sh

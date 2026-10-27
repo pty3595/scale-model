@@ -1,0 +1,14 @@
+{
+  "name": "여기에 대상 클러스터 이름",
+  "_쓰는_곳": "report.py --target. sweep 곡선 위에서 대상 클러스터의 운영점을 찾는다 (plan 에는 쓰지 않는다)",
+  "_필수": "storage_nodes, 그리고 아래 두 쌍을 각각 하나씩",
+  "storage_nodes": 0,
+  "_클라이언트가_읽는_KV": "대수를 알면 clients + per_client_kv_*, 합계만 알면 aggregate_kv_*. 사양서가 아니라 모니터링 값",
+  "clients": 0,
+  "per_client_kv_gbps": 0,
+  "_노드_한_대의_읽기_능력": "per_node_capability_* 또는 aggregate_capability_*",
+  "per_node_capability_gbps": 0,
+  "_클라이언트_링크": "선택. 있으면 먼저 차는 자원(디스크 대 클라이언트 링크)을 우리와 비교한다. per_client_nic_*(clients 와 함께) 또는 aggregate_client_nic_*",
+  "per_client_nic_gbit": 0,
+  "_단위": "gbps는 GB/s(10진), gibps는 GiB/s(2진), gbit은 Gbit/s. 쓰는 쪽만 남긴다."
+}

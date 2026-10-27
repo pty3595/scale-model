@@ -1,0 +1,9 @@
+{
+  "name": "레퍼런스 아키텍처 — storage 8노드",
+  "_source": "IBM Redbook MD260021. storage 8노드(노드당 NVMe 16개)가 읽기 315 GB/s 를 낼 수 있고, GPU 서버 쪽 네트워크(2x400GbE)가 80 GB/s 까지만 받는다. 80 은 측정한 사용량이 아니라 클라이언트 네트워크 한계다. GPU 쪽은 RTX PRO 6000 4장짜리 서버 1대",
+  "_note": "aggregate_kv_gbps 80 은 운영점이 아니라 이 구성이 낼 수 있는 상한 → 여기서 나온 디스크 읽기 사용률 0.254 도 상한이다. 벤더 검증 구성이라 운영 비율로 읽지 않는다",
+  "storage_nodes": 8,
+  "aggregate_capability_gbps": 315,
+  "aggregate_kv_gbps": 80,
+  "aggregate_client_nic_gbps": 80
+}
