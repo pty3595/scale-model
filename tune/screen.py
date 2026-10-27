@@ -75,7 +75,7 @@ def knob(v, nd=16):
     w = v.get("workers", 16)
     ops = '{"lookup":%d,"retrieve":%d,"store":%d}' % (v.get("lookup", 2), v.get("retrieve", w), v.get("store", w))
     aj = T.hf3fs(nd, True).replace('{"lookup":2,"retrieve":16,"store":16}', ops)
-    return dict(nd=nd, aj=aj, py=T.HF_PY, prefix=T.AT)
+    return dict(nd=nd, aj=aj)
 
 
 def data_dir(stripe, nd=16, wm=""):
@@ -104,9 +104,9 @@ def skip(v):
 
 class Screen(T.Sweep):
     def __init__(self, deadline, model="qwen3-14b", folders=16, trace="coder"):
-        super().__init__("a", trace, model)
+        super().__init__("hf3fs", trace, model)
         self.ref = json.loads(self.res_path.read_text()).get(f"s16-d{folders}+base", {}) if self.res_path.exists() else {}
-        self.out = T.OUT / f"a{self.wm}-screen"
+        self.out = T.OUT / f"hf3fs{self.wm}-screen"
         (self.out / "runs").mkdir(parents=True, exist_ok=True)
         self.res_path = self.out / "result.json"
         self.res = json.loads(self.res_path.read_text()) if self.res_path.exists() else {}
@@ -176,7 +176,7 @@ def main():
     ok = [float(k) for k, m in sc.ref.items() if m["ok"]]
     base_lv = T.on_grid(args.base_lv) if args.base_lv else max(ok, default=None)
     if base_lv is None:
-        raise SystemExit(f"기준의 최대 배속을 모른다 — tune.py sweep a --knobs s16-d{nd} 를 먼저 돌리거나 --base-lv 를 준다")
+        raise SystemExit(f"기준의 최대 배속을 모른다 — tune.py sweep hf3fs --knobs s16-d{nd} 를 먼저 돌리거나 --base-lv 를 준다")
     # --cands 에 base 를 넣으면 기준 설정도 같은 호출에서 돈다(같은 때 · 미리 쓴 chunk 를 같이 쓴다, 10-23 주말)
     cands = [c for c in [("base", {})] + CANDS if (args.cands and c[0] in args.cands.split(",")) or (not args.cands and c[0] != "base")]
     S.log(f"== {'다시 돌리기' if args.repeat else '거르기'} ({args.model}, store 16 · 폴더 {nd}, 기준 최대 배속 x{base_lv:g}, 마감 {hm})")

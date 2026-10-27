@@ -406,7 +406,7 @@ def check():
     sys.path.insert(0, str(HERE))
     import screen as SC
     import tune as T
-    tool = ({n for n in T.SETTINGS if n != "base"} | {n for v in T.VERSIONS.values() for n in v["knobs"]} | {c[0] for c in SC.CANDS})
+    tool = ({n for n in T.SETTINGS if n != "base"} | {n for v in T.ADAPTERS.values() for n in v["knobs"]} | {c[0] for c in SC.CANDS})
     mine = {n for k in KNOBS for n, _ in k["cands"]}
     extra = sorted(tool - mine)
     if extra:

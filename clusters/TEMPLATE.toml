@@ -89,3 +89,7 @@ chunk_bytes = ""
 # fio_usrbio = "/opt/3fs/bin/fio-usrbio"
 # usrbio_engine = "/opt/3fs/lib/fio/hf3fs_usrbio.so"
 # hf3fs_lib = "/opt/3fs/lib"
+# (선택) adapter 마다 LMCache 빌드를 따로 두었을 때만. 없으면 [[client]] python 그대로 — upstream LMCache 하나에 adapter 셋이 다 있다
+# [builds.hf3fs]                  # nixl_store_dynamic · nixl_native · hf3fs
+# python = "$HOME/venv-lmcache-hf3fs/bin/python"
+# pythonpath = "$HOME/LMCache-hf3fs"      # (선택) 그 python 위에 PYTHONPATH 로 얹을 LMCache 소스
