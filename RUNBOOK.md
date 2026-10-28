@@ -80,21 +80,26 @@
 
 모든 클라이언트(replay 를 돌리는 노드 — `clusters/<이름>.toml` 의 `[[client]]`)에 adapter 셋이 다 돌게 한다. 끝나면 `python3 tune/agent.py install` 이 "설치 확인 통과" 여야 한다.
 `<venv>` 는 `[[client]] python` 의 venv 폴더(예: `$HOME/venv-lmcache`)다. 한 단계가 실패하면 출력을 그대로 보고하고 멈춘다.
+설치 명령은 적힌 그대로 친다. 이 절에서만 `cd` 를 쓴다.
 
-1. NIXL 1.4.1 — `nixl_store_dynamic` · `nixl_native` 가 쓴다. HF3FS plugin 은 cu13 wheel 에만 있다
+1. NIXL — `nixl_store_dynamic` · `nixl_native` 가 쓴다. 버전은 정하지 않는다(LMCache `6e69015` 는 1.3.0 이상이면 된다). HF3FS plugin 은 cu13 wheel 에만 있어 셋을 다 깐다
 
    ```bash
-   <venv>/bin/pip install nixl==1.4.1 nixl-cu12==1.4.1 nixl-cu13==1.4.1
+   <venv>/bin/pip install -U nixl nixl-cu12 nixl-cu13
+   <venv>/bin/pip show nixl
    ```
 
-2. NIXL C++ 헤더 — `nixl_native` 의 확장(`lmcache_nixl`)을 빌드할 때 쓴다. 받을 수 없으면 사용자에게 네 파일을 옮겨 달라고 한다
+   `Version:` 줄의 값이 아래 `<nixl 버전>` 이다. 보고에 적는다(Spark 측정은 1.4.1 이었다).
+   nixl 은 torch 의 CUDA 빌드(12 · 13)에 맞는 backend 를 고른다. torch 가 CUDA 12 빌드면 HF3FS plugin 이 없는 cu12 를 골라 nixl adapter 가 못 돈다 — `agent.py install` 이 이것을 잡는다. 잡히면 보고한다
+
+2. NIXL C++ 헤더 — `nixl_native` 의 확장(`lmcache_nixl`)을 빌드할 때 쓴다. 설치한 NIXL 과 같은 버전의 tag 에서 받는다. 받을 수 없으면 사용자에게 네 파일을 옮겨 달라고 한다
 
    ```bash
-   mkdir -p $HOME/nixl-1.4.1-include
-   curl -fsSL -o $HOME/nixl-1.4.1-include/nixl.h https://raw.githubusercontent.com/ai-dynamo/nixl/v1.4.1/src/api/cpp/nixl.h
-   curl -fsSL -o $HOME/nixl-1.4.1-include/nixl_descriptors.h https://raw.githubusercontent.com/ai-dynamo/nixl/v1.4.1/src/api/cpp/nixl_descriptors.h
-   curl -fsSL -o $HOME/nixl-1.4.1-include/nixl_params.h https://raw.githubusercontent.com/ai-dynamo/nixl/v1.4.1/src/api/cpp/nixl_params.h
-   curl -fsSL -o $HOME/nixl-1.4.1-include/nixl_types.h https://raw.githubusercontent.com/ai-dynamo/nixl/v1.4.1/src/api/cpp/nixl_types.h
+   mkdir -p $HOME/nixl-include
+   curl -fsSL -o $HOME/nixl-include/nixl.h https://raw.githubusercontent.com/ai-dynamo/nixl/v<nixl 버전>/src/api/cpp/nixl.h
+   curl -fsSL -o $HOME/nixl-include/nixl_descriptors.h https://raw.githubusercontent.com/ai-dynamo/nixl/v<nixl 버전>/src/api/cpp/nixl_descriptors.h
+   curl -fsSL -o $HOME/nixl-include/nixl_params.h https://raw.githubusercontent.com/ai-dynamo/nixl/v<nixl 버전>/src/api/cpp/nixl_params.h
+   curl -fsSL -o $HOME/nixl-include/nixl_types.h https://raw.githubusercontent.com/ai-dynamo/nixl/v<nixl 버전>/src/api/cpp/nixl_types.h
    ```
 
 3. LMCache `6e69015` 를 adapter 셋 모두 넣어 빌드한다 — 시뮬레이터 규칙이 이 버전에 맞춰져 있다. 한 노드에서 빌드하고, 다른 클라이언트에는 같은 경로로 복사한다(빌드 지문이 같아야 replay 가 돈다)
@@ -107,7 +112,7 @@
    빌드는 `$HOME/LMCache-6e69015` 폴더에서 한 줄로 친다. `<absl>` · `<3fs lib>` 는 hf3fs 를 처음 빌드할 때 쓴 값(Abseil 헤더 폴더 · `libhf3fs_api_shared.so` 가 있는 폴더, 보통 `/opt/3fs/lib`)이다. python 이 3.12 가 아니면 `python3.12` 를 그 버전으로 바꾼다
 
    ```bash
-   NO_GPU_EXT=1 BUILD_WITH_HF3FS=1 BUILD_HF3FS=1 HF3FS_INCLUDE_DIR=<absl> HF3FS_LIB_DIR=<3fs lib> BUILD_WITH_NIXL=1 NIXL_INCLUDE_DIR=$HOME/nixl-1.4.1-include NIXL_LIBRARY_DIR=<venv>/lib/python3.12/site-packages/.nixl_cu13.mesonpy.libs <venv>/bin/python setup.py build_ext --inplace > $HOME/lmcache-6e69015-build.log 2>&1
+   NO_GPU_EXT=1 BUILD_WITH_HF3FS=1 BUILD_HF3FS=1 HF3FS_INCLUDE_DIR=<absl> HF3FS_LIB_DIR=<3fs lib> BUILD_WITH_NIXL=1 NIXL_INCLUDE_DIR=$HOME/nixl-include NIXL_LIBRARY_DIR=<venv>/lib/python3.12/site-packages/.nixl_cu13.mesonpy.libs <venv>/bin/python setup.py build_ext --inplace > $HOME/lmcache-6e69015-build.log 2>&1
    ```
 
    `$HOME/lmcache-6e69015-build.log` 에 `Using explicitly requested storage backend: hf3fs` 와 `...: nixl` 두 줄이 있어야 한다. 그다음 `clusters/<이름>.toml` 에 적는다
@@ -129,7 +134,31 @@
 
    `clusters/<이름>.toml` 의 `[builds]` 에 `pwrite_shim = "$HOME/pwrite_full.so"` 를 적는다
 
-5. `python3 tune/agent.py install` — 클라이언트마다 adapter 셋의 import · NIXL HF3FS plugin · shim · 빌드 지문을 본다. "설치 확인 통과" 가 나올 때까지 측정하지 않는다
+5. fio-usrbio — `ceiling.py`(3FS 경로 천장)가 쓴다. 모든 클라이언트에 `/opt/3fs/bin/fio-usrbio` 와 `/opt/3fs/lib/fio/hf3fs_usrbio.so` 가 이미 있으면 건너뛴다.
+   없으면 소스로 빌드한다 — fio(Spark 와 같은 3.36)와 3FS 소스의 `benchmarks/fio_usrbio` 엔진. 3FS 소스는 설치된 3FS 와 같은 commit 으로 둔다:
+   `strings <hf3fs_fuse_main 경로> | grep -m1 "Version: v"` 줄의 마지막 `-` 뒤가 그 commit 이다(아래 `<3FS commit>`)
+
+   ```bash
+   git clone --branch fio-3.36 --depth 1 https://github.com/axboe/fio.git $HOME/fio
+   cd $HOME/fio
+   ./configure
+   make -j
+   cd -
+   git clone https://github.com/deepseek-ai/3FS.git $HOME/3FS-src
+   git -C $HOME/3FS-src checkout <3FS commit>
+   make -C $HOME/3FS-src/benchmarks/fio_usrbio HF3FS_LIB_DIR=/opt/3fs/lib HF3FS_INCLUDE_DIR=$HOME/3FS-src/src/lib/api FIO_SRC_DIR=$HOME/fio
+   ```
+
+   `HF3FS_LIB_DIR` 는 `libhf3fs_api_shared.so` 가 있는 폴더다(보통 `/opt/3fs/lib`). 모든 클라이언트에 같은 경로로 두고(노드마다 같은 명령, 또는 한 곳에서 빌드해 복사),
+   `clusters/<이름>.toml` 의 `[builds]` 에 **절대 경로로** 적는다 — `ceiling.py` 가 경로를 따옴표로 감싸 `$HOME` 이 풀리지 않는다
+
+   ```toml
+   fio_usrbio = "/home/<계정>/fio/fio"
+   usrbio_engine = "/home/<계정>/3FS-src/benchmarks/fio_usrbio/hf3fs_usrbio.so"
+   hf3fs_lib = "/opt/3fs/lib"
+   ```
+
+6. `python3 tune/agent.py install` — 클라이언트마다 adapter 셋의 import · NIXL backend(cu13)와 버전 · NIXL HF3FS plugin · shim · 빌드 지문을 본다. "설치 확인 통과" 가 나올 때까지 측정하지 않는다
 
 ## 클러스터 파일 · 천장
 
@@ -141,7 +170,7 @@
 | 2 | `SM_CLUSTER=<이름> python3 cluster.py discover <이름>` | 초안. 빈칸과 `# 확인` 줄을 목록으로 사용자에게 보여 주고 사람이 채운다. 추측해서 채우지 않는다 |
 | 3 | `python3 cluster.py check` | 마지막 줄 "통과" |
 | 4 | `python3 tune/settings.py home` | "HOME 과 같다" |
-| 5 | `python3 ceiling.py` | `clusters/<이름>-ceiling.json`. 읽기 · 쓰기 합(GiB/s)을 보고한다. storage 설정이 바뀐 뒤에만 다시 |
+| 5 | `python3 ceiling.py` | `clusters/<이름>-ceiling.json`. 읽기 · 쓰기 합(GiB/s)을 보고한다. storage 설정이 바뀐 뒤에만 다시. fio-usrbio · 엔진이 없다고 하면 "설치" 5 |
 
 ## 측정
 

@@ -172,6 +172,13 @@ for m in need:
     except Exception as e:
         out[m] = f"없음 — {type(e).__name__}: {e}"[:240]
 if plugin:
+    try:
+        import importlib.metadata, nixl        # nixl 은 torch 의 CUDA 빌드로 cu12 · cu13 backend 를 고른다. HF3FS plugin 은 cu13 에만 있다
+        b = getattr(getattr(nixl, "_pkg", None), "__name__", "?")
+        v = importlib.metadata.version("nixl")
+        out["NIXL backend"] = f"ok {b} {v}" if b == "nixl_cu13" else f"없음 — {b} {v} 를 골랐다(torch CUDA {getattr(sys.modules.get('torch'), 'version', None) and sys.modules['torch'].version.cuda}). HF3FS plugin 은 nixl_cu13 에만 있다"
+    except Exception as e:
+        out["NIXL backend"] = f"없음 — {type(e).__name__}: {e}"[:240]
     p = os.path.join(plugin.replace("{venv}", sys.prefix), "libplugin_HF3FS.so")
     out["NIXL HF3FS plugin"] = "ok" if os.path.isfile(p) else f"없음 — {p}"
 try:
@@ -202,10 +209,11 @@ def install():
                 res = json.loads(r.stdout.strip().splitlines()[-1])
             except (IndexError, json.JSONDecodeError):
                 res = {"python": f"못 돌렸다 — {(r.stderr or r.stdout).strip()[-240:]}"}
-            bad = {k: v for k, v in res.items() if k != "lmcache" and v != "ok"}
+            bad = {k: v for k, v in res.items() if k != "lmcache" and not v.startswith("ok")}
             good &= not bad
             prints.setdefault(a, {})[c["host"]] = res.get("lmcache", "")
-            print(f"[{'통과' if not bad else '실패'}] {c['host']:12} {a:19} " + ("; ".join(f"{k}: {v}" for k, v in bad.items()) or res.get("lmcache", "")))
+            info = res.get("lmcache", "") + (f", {res['NIXL backend'][3:]}" if "NIXL backend" in res and not bad else "")
+            print(f"[{'통과' if not bad else '실패'}] {c['host']:12} {a:19} " + ("; ".join(f"{k}: {v}" for k, v in bad.items()) or info))
         shim = C.sh(a_, f"test -f {T.PW_SHIM} && echo y", check=False).strip() == "y"
         good &= shim
         print(f"[{'통과' if shim else '실패'}] {c['host']:12} pwrite shim {T.PW_SHIM}" + ("" if shim else " 없음 — RUNBOOK 설치 4"))
