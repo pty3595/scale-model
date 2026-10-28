@@ -65,10 +65,11 @@ trace: `alibaba-chat(A)` `alibaba-api(B)` `alibaba-thinking` `alibaba-coder` `mo
 | `traces.py` | trace 목록과 prompt 만들기 (`hash_ids` → token) |
 | `calibration.json` | 소프트웨어의 성질(object 모양, adapter)과 PoC 실측 기록. 클러스터마다 다른 값은 `cluster.py` 가 그 클러스터의 것으로 덮어 driver 에 보낸다 |
 | `cluster.py` · `clusters/` | 클러스터 고유 값(호스트 · 계정 · 3FS 경로 · storage node · NIC · NVMe · 천장 · 바꿔도 되는 것)은 모두 `clusters/<이름>.toml` 에 있다. `discover` · `check` · `env`. "다른 클러스터로 옮기기" |
-| `tune/` | 설정 sweep 도구 — `tune.py`(adapter 설정 → 클러스터 설정 순서로 따라가는 최대 배속. x1 에서 두 배씩 건너 경계를 찾고 15% 칸으로 좁힌다), `screen.py`(후보 거르기 · 다시 돌리기), `settings.py`(FUSE 템플릿 · storage hot-update 걸기 · 확인 · 되돌리기), `analyze.py`(판정), `families.py`(plan 묶음), `guard.py`(남의 작업 — vLLM · LMCache 서버 · SGLang · Mooncake · Ray · GPU 프로세스), `knobs.py` → `KNOBS.md`(손잡이 목록 — 그 클러스터의 결과에서 낸다) |
+| `tune/` | 설정 sweep 도구 — `tune.py`(adapter 설정 → 클러스터 설정 순서로 따라가는 최대 배속. x1 에서 두 배씩 건너 경계를 찾고 15% 칸으로 좁힌다), `screen.py`(후보 거르기 · 다시 돌리기), `settings.py`(FUSE 템플릿 · storage hot-update 걸기 · 확인 · 되돌리기), `analyze.py`(판정), `families.py`(plan 묶음), `guard.py`(남의 작업 — vLLM · LMCache 서버 · SGLang · Mooncake · Ray · GPU 프로세스), `knobs.py` → `KNOBS.md`(손잡이 목록 — 그 클러스터의 결과에서 낸다), `agent.py`(AI 에이전트의 입구 — 설치 확인 · 점검 · 측정 계획 · 지켜보기 · 멈추기 · 보고 표), `pwrite_full.c`(NIXL `dram_zc` 의 2 GiB 등록 실패를 피하는 LD_PRELOAD shim 소스) |
 | `throttle.sh` | 디스크(NVMe 마다 읽기·쓰기 따로)·망(클라이언트·storage 포트 따로) 성능 상한을 걸고 푼다. 망 상한은 송신만 막아 incast 손실이 사라지는데, 이 차이는 무시하고 쓴다 |
 | `targets/serving-base.json` | 기준 서빙 설정 (Qwen3-14B, GPU KV 24 GiB, L1 32 GiB, LMCache 기본값) |
 | `targets/*.json` | 대상 클러스터 사양 (`report.py --target`) |
+| `RUNBOOK.md` | 이 도구를 돌리는 AI 에이전트의 작업 지시서 — 목적, 하지 않는 것, adapter 셋 설치, 측정 계획을 끝까지 돌리는 순서, 도구가 재는 값, 결과 보고 |
 | `validate/clean_iov.sh` | 죽은 프로세스가 남긴 hf3fs iov(공유 메모리)를 지운다. replay 가 실행마다 클라이언트에서 부른다 |
 
 replay 는 실행마다 이 장비의 `driver.py` 를 다른 클라이언트의 작업 폴더에 덮어쓰고, calibration 은 `/tmp/scale-model-calibration.json` 으로 보낸다.
