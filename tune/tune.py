@@ -3,16 +3,16 @@
 replay 가 그 adapter 의 실제 IO 를 아직 내는지 chunk 대조로 확인한다. LMCache 가 바뀌면 verify → (어긋나면 시뮬레이터 규칙 고침) → sweep.
 
   tune.py verify ADAPTER                 실제 vLLM + 계측 LMCache 3대 대 시뮬레이터, 데워진 구간 chunk 대조 (약 1.5시간)
-  tune.py sweep ADAPTER [--knobs a,b] [--settings x,y] [--trace T] [--model M]
+  tune.py sweep ADAPTER [--knobs a,b] [--settings x,y] [--trace T] [--model M] [--clients N]
                                          adapter 설정마다 → 가장 좋은 것에 FUSE · layout 설정마다, 따라가는 최대 배속
                                          (trace 구간 · 모델의 KV 크기를 바꿔 같은 sweep — WORKLOADS · MODELS)
   tune.py table                          결과 표
 
-ADAPTER 는 nixl_store_dynamic · nixl_native · hf3fs — 종류마다 하나(ADAPTERS). 클러스터 설정 목록은 SETTINGS. 실행마다 다른 사람의 작업이 없는지 보고, 끝나면(어떻게 끝나든) FUSE · storage 를 되돌린다.
+ADAPTER 는 nixl_store_dynamic · nixl_native · hf3fs · raw_hf3fs(PR 5828, 클라이언트 1대) — 종류마다 하나(ADAPTERS). 클러스터 설정 목록은 SETTINGS. 실행마다 다른 사람의 작업이 없는지 보고, 끝나면(어떻게 끝나든) FUSE · storage 를 되돌린다.
 클러스터 고유 값과 허락 범위는 clusters/<이름>.toml(cluster.py). 허락이 없는 쪽을 바꾸는 설정은 건너뛴다. 재시작이 필요한 설정은 SETTINGS 에 없다.
 시작 때 클러스터가 되돌릴 곳(템플릿 사본 · [home])에 있는지 보고, 아니면 멈춘다.
 replay 의 IO 는 LMCache 규칙(cache_sim.py 의 lmcache.rules)으로 만든 plan 을 쓴다.
-LMCache 는 [[client]] python 의 것을 쓴다 — upstream 6e69015(10-17) 이후 하나에 adapter 셋이 다 있다.
+LMCache 는 [[client]] python 의 것을 쓴다 — RULES 의 commit(README "기준 버전") 하나에 adapter 셋이 다 있다.
 adapter 마다 빌드를 따로 두었으면 clusters/<이름>.toml [builds.<adapter>] 의 python · pythonpath (클라이언트마다 같은 경로).
 판정은 analyze.py, plan 묶음은 families.py, 클러스터 층 설정은 settings.py(results/ 의 10-12 · 10-18 코드에서 옮겼다).
 """
@@ -39,7 +39,8 @@ import settings as S           # noqa: E402  FUSE · storage 적용 · 확인 ·
 from guard import busy         # noqa: E402
 from replay import admin, ensure_layout     # noqa: E402
 
-OUT = SM / "results/tune-speed"      # 배속 격자부터(10-27). 그 전 단계(디스크 읽기 사용률) 격자의 결과는 results/tune
+RULES = "ad1d738"                    # 시뮬레이터 규칙 = 맞춘 LMCache commit (cache_sim.py 머리말, README "기준 버전")
+OUT = SM / f"results/tune-{RULES}"   # 규칙마다 따로. 8d7d2c4 · 배속 격자 결과는 results/tune-speed, 그 전 단계 격자는 results/tune
 DATA = C.data("tune")
 GRID = [float(f"{2 ** (k / 5):.3g}") for k in range(-10, 31)]   # 배속 x0.25-x64. 한 칸 15%(2^(1/5)), 다섯 칸이 두 배
 JUMP, START = 5, 1.0                 # search 는 START 에서 두 배씩 건너 경계를 찾은 뒤 한 칸씩 올린다
@@ -71,6 +72,18 @@ def native(nw, mem="dram", dio="true"):
             '"mount_point":"' + C.MOUNT + '","mem_config":"' + mem + '"},"num_workers":' + str(nw) + "}")
 
 
+RAW = {k: C.C["threefs"].get(k, "") for k in ("mgmtd", "cluster_id", "ib_devices")}   # raw_hf3fs 가 FUSE 없이 붙을 곳 — FUSE launcher 설정의 값
+
+
+def raw(nw, ops=None, conc=None):
+    """raw_hf3fs(PR 5828) 설정. 파일은 재생 폴더 하나(base_dir = 3FS 루트 기준 {rdir}).
+    conc = (max_concurrent_requests, _per_server, max_batch_bytes) — 없으면 PR 기본 256 · 64 · 32 MiB. 읽기 · 쓰기가 같은 값을 쓴다"""
+    c = dict(zip(("max_concurrent_requests", "max_concurrent_requests_per_server", "max_batch_bytes"), conc or ()))
+    return json.dumps({"type": "raw_hf3fs", "num_workers": nw, "meta_addr": RAW["mgmtd"], "mgmtd_addr": RAW["mgmtd"],
+                       "cluster_id": RAW["cluster_id"], "base_dir": "{rdir}", **({"per_op_workers": ops} if ops else {}), **c},
+                      separators=(",", ":"))
+
+
 def build(adapter):
     """그 adapter 를 돌릴 LMCache — [builds.<adapter>] 의 python · pythonpath. 없으면 [[client]] python, PYTHONPATH 없음"""
     b = C.C.get("builds", {}).get(adapter, {})
@@ -81,14 +94,14 @@ def build(adapter):
 PW_SHIM = C.C.get("builds", {}).get("pwrite_shim", "/tmp/pwrite_full.so")
 # adapter 종류마다 하나: 시뮬레이터의 LMCache 규칙, 실제 대조(verify)를 하는가, adapter 설정(knob)마다 replay 인자
 ADAPTERS = {
-    "nixl_store_dynamic": dict(rules="8d7d2c4", verify=True, knobs={
+    "nixl_store_dynamic": dict(rules=RULES, verify=True, knobs={
         "dram": dict(nd=1),                                                   # calibration 의 adapter (문서 예시 아님 — 문서는 mem_config 를 안 준다)
         "auto": dict(nd=1, bp=["mem_config=auto"]),                           # nixl.rst 예시 = mem_config 없음 = plugin 기본값 auto
         "dram_zc": dict(nd=1, bp=["mem_config=dram_zc"], prefix=f"LD_PRELOAD={PW_SHIM}"),   # NIXL 2 GiB 버그 shim
         "dram_zc-a4k": dict(nd=1, bp=["mem_config=dram_zc"], prefix=f"LD_PRELOAD={PW_SHIM}", l1a=4096),   # L1 정렬 LMCache 기본(4 KiB)
         "dram_zc-a2m": dict(nd=1, bp=["mem_config=dram_zc"], prefix=f"LD_PRELOAD={PW_SHIM}", l1a=2097152),
         "dram_zc-nodio": dict(nd=1, bp=["mem_config=dram_zc", "use_direct_io=false"], prefix=f"LD_PRELOAD={PW_SHIM}")}),   # O_DIRECT 끔   # 2 MiB — 8 MiB 가 나은 까닭이 huge page 경계인가
-    "nixl_native": dict(rules="8d7d2c4", verify=False, knobs={
+    "nixl_native": dict(rules=RULES, verify=False, knobs={
         "w4": dict(nd=1, aj=native(4)),
         "w16": dict(nd=1, aj=native(16)),
         "w16-a4k": dict(nd=1, aj=native(16), l1a=4096),   # L1 정렬 LMCache 기본(4 KiB)
@@ -96,7 +109,7 @@ ADAPTERS = {
         "w16-zc": dict(nd=1, aj=native(16, "dram_zc"), prefix=f"LD_PRELOAD={PW_SHIM}"),
         "w16-zc-a4k": dict(nd=1, aj=native(16, "dram_zc"), prefix=f"LD_PRELOAD={PW_SHIM}", l1a=4096),
         "w16-nodio": dict(nd=1, aj=native(16, dio="false"))}),   # O_DIRECT 끔
-    "hf3fs": dict(rules="8d7d2c4", verify=True, knobs={
+    "hf3fs": dict(rules=RULES, verify=True, knobs={
         "w4-d1": dict(nd=1, aj=hf3fs(1, False)),
         "s16-d1": dict(nd=1, aj=hf3fs(1, True)),
         "s16-d16": dict(nd=16, aj=hf3fs(16, True)),
@@ -107,7 +120,22 @@ ADAPTERS = {
         "s16-d1-sl4": dict(nd=1, aj=hf3fs(1, True), slots=4),
         "s16-d1-sl16": dict(nd=1, aj=hf3fs(1, True), slots=16),
         "doc": dict(nd=2, aj=hf3fs_doc())}),             # hf3fs.rst 예시
+    # PR 5828(10-25, 열림) — FUSE · usrbio 없이 3FS storage client 로 직접, 파일 하나에 offset. 빌드는 HANDOFF.
+    # key → offset 표가 프로세스 메모리에만 있어 다른 클라이언트가 쓴 chunk 를 못 찾는다 — 클라이언트 1대 plan 으로만(clients).
+    # chunk 를 모든 chain 에 직접 쓴다 — 재생 폴더가 stripe = chain 수 · chunk = connector 의 chunk_size(4 MiB)여야(layout)
+    # FUSE 로 파일을 지울 때 meta 가 모든 chain 에서 지운다(meta dynamic_stripe 가 꺼져 있어야 — 켜져 있으면 일부 chain 만)
+    "raw_hf3fs": dict(rules=RULES, verify=False, clients=1, layout=4194304, knobs={
+        "w4": dict(nd=1, aj=raw(4)),                                                       # PR 의 l2 bench 설정
+        "doc": dict(nd=1, aj=raw(4, {"lookup": 2, "retrieve": 16, "store": 4})),           # raw_hf3fs.rst 예시
+        "s16": dict(nd=1, aj=raw(4, {"lookup": 2, "retrieve": 16, "store": 16})),          # hf3fs s16 과 같은 lane
+        # 10-28 w4(PR 기본 256 · 64 · 32 MiB)는 x0.5 에서도 load + store 약 1.5 GiB/s 에 막히고 storage 수신 버림이 hf3fs 의 몇 배 —
+        # 손실 망에서 한꺼번에 돌아오는 바이트(동시 수 x 묶음)가 많다(HANDOFF "망 손실과 읽기 설정": 24-32 MB 이하면 깨끗). connector chunk 가 4 MiB 라 묶음도 4 MiB
+        "c8-2": dict(nd=1, aj=raw(4, conc=(8, 2, 4 << 20))),                                # 32 MB — 손실 없는 한도
+        "c12-3": dict(nd=1, aj=raw(4, conc=(12, 3, 4 << 20))),                              # FUSE 기준 읽기(12/3 · 4MB)
+        "c64-32": dict(nd=1, aj=raw(4, conc=(64, 32, 4 << 20)))}),                          # FUSE 기준 쓰기(64/32 · 4MB)
 }
+for k in ADAPTERS["raw_hf3fs"]["knobs"].values():
+    k["prefix"] = f"LMCACHE_3FS_IB_DEVICES={RAW['ib_devices']}" if RAW["ib_devices"] else ""   # FUSE 와 같은 RDMA 장치(로컬 패치)
 # 클러스터 설정 (기준에서 하나씩). chunk 는 재생 폴더의 3FS layout
 SETTINGS = {
     # base = 실험 기준 settings.REF(clusters/<이름>.toml [ref], 측정으로 고른 값, 템플릿과 따로 — 읽기 12/3 · 4MB 는 09-14-15 의 최적화). src = 3FS 소스 기본값(읽기 32/8 · 4MB) — 보고의 출발점(HANDOFF 기준선)
@@ -121,13 +149,15 @@ SETTINGS = {
 
 
 # --- plan ---
-def family(rules, wl="coder", model="qwen3-14b", ev=None):
-    """trace 구간 하나 x 메모리 설정 x LMCache 규칙 x 모델(x L1 비우기 문턱 · 비율). a44d5e5 · 기본 모델은 예전 sweep 의 plan 그대로."""
+def family(rules, wl="coder", model="qwen3-14b", ev=None, n=None):
+    """trace 구간 하나 x 메모리 설정 x LMCache 규칙 x 모델(x L1 비우기 문턱 · 비율 x 클라이언트 수). a44d5e5 · 기본 모델은 예전 sweep 의 plan 그대로.
+    n: 클라이언트(= LMCache 서버) 수, 기본 클러스터의 [[client]] 전부. 적으면 같은 trace 구간을 그 대수가 나눠 받는다"""
     trace, start, minutes = WORKLOADS[wl]
-    if rules == "a44d5e5" and model == "qwen3-14b" and not ev:
+    n = n or len(C.CLIENTS)
+    if rules == "a44d5e5" and model == "qwen3-14b" and not ev and n == len(C.CLIENTS):
         return F.make(trace, start, minutes, MEM)
     d = SM / "plans/tune" / (f"{F.fam_name(trace, start, minutes, MEM)}-{rules}" + ("" if model == "qwen3-14b" else f"-{model}")
-                             + (f"-ev{ev.replace('/', '-')}" if ev else ""))
+                             + (f"-ev{ev.replace('/', '-')}" if ev else "") + ("" if n == len(C.CLIENTS) else f"-n{n}"))
     if not (d / "base.json").exists():
         cfg = F.serving_cfg(MEM)
         cfg["lmcache"]["rules"] = rules
@@ -136,7 +166,7 @@ def family(rules, wl="coder", model="qwen3-14b", ev=None):
             w, r = ev.split("/")
             cfg["lmcache"]["eviction_trigger_watermark"], cfg["lmcache"]["eviction_ratio"] = float(w), float(r)
         d.mkdir(parents=True, exist_ok=True)
-        (d / "base.json").write_text(json.dumps(P.simulate(trace, start, minutes, len(C.CLIENTS), cfg)))
+        (d / "base.json").write_text(json.dumps(P.simulate(trace, start, minutes, n, cfg)))
     return d
 
 
@@ -179,10 +209,21 @@ def data_dir(adapter, knob, chunk, wm=""):
 
 # --- sweep ---
 class Sweep:
-    def __init__(self, adapter, wl="coder", model="qwen3-14b", ev=None):
+    def __init__(self, adapter, wl="coder", model="qwen3-14b", ev=None, n=None, prefill_tps=0):
         self.adapter, self.v = adapter, ADAPTERS[adapter]
-        self.fam = family(self.v["rules"], wl, model, ev)
-        self.wm = ("" if wl == "coder" else f"-{wl}") + ("" if model == "qwen3-14b" else f"-{model}") + (f"-ev{ev.replace('/', '-')}" if ev else "")
+        self.prefill_tps = prefill_tps
+        n = n or self.v.get("clients") or len(C.CLIENTS)
+        if self.v.get("clients") and n != self.v["clients"]:
+            raise SystemExit(f"{adapter} 는 클라이언트 {self.v['clients']}대로만 돈다(--clients {self.v['clients']}) — key 표가 프로세스 안에만 있다")
+        if adapter == "raw_hf3fs":
+            if not (RAW["mgmtd"] and RAW["cluster_id"]):
+                raise SystemExit("clusters/<이름>.toml [threefs] 에 mgmtd · cluster_id 가 없다(FUSE launcher 설정의 mgmtd_server_addresses · cluster_id)")
+            chains = len(admin("list-chains").splitlines()) - 1
+            if chains != STRIPE:
+                raise SystemExit(f"chain {chains}개 ≠ 기본 stripe {STRIPE} — raw_hf3fs 의 chunk 가 재생 폴더의 layout 밖 chain 에 남는다")
+        self.fam = family(self.v["rules"], wl, model, ev, n)
+        self.wm = (("" if wl == "coder" else f"-{wl}") + ("" if model == "qwen3-14b" else f"-{model}") + (f"-ev{ev.replace('/', '-')}" if ev else "")
+                   + ("" if n == len(C.CLIENTS) else f"-n{n}") + (f"-p{prefill_tps:g}" if prefill_tps else ""))
         self.out = OUT / f"{adapter}{self.wm}"
         (self.out / "runs").mkdir(parents=True, exist_ok=True)
         self.res_path = self.out / "result.json"
@@ -213,7 +254,8 @@ class Sweep:
                + (f" --python '{py}'" if py else "")
                + (f" --prefix '{prefix}'" if prefix else "")
                + (f" --l1-align {c['l1a']}" if c.get("l1a") else "")
-               + "".join(f" --backend-param {kv}" for kv in c.get("bp", [])))
+               + "".join(f" --backend-param {kv}" for kv in c.get("bp", []))
+               + (f" --prefill-tps {self.prefill_tps:g}" if self.prefill_tps else ""))
         with open(f"{out}.log", "w") as lf:
             subprocess.run(["bash", "-c", cmd], stdout=lf, stderr=subprocess.STDOUT, check=True)
         if json.loads((out / "summary.json").read_text()).get("storage_restart"):
@@ -263,13 +305,16 @@ class Sweep:
         """search 대신 그 배속만 다시 잰다(tag 끝 .r2 · .r3 …) — 한 칸 차이를 세 번 중 두 번으로 정할 때"""
         for name in settings:
             f = SETTINGS[name]
+            if self.v.get("layout") and f.get("chunk"):
+                S.log(f"   {name}: {self.adapter} 는 재생 폴더 chunk 가 {self.v['layout']} 로 정해져 있어 건너뛴다")
+                continue
             try:
                 S.apply({**S.BASE, **{k: v for k, v in f.items() if k != "chunk"}})
             except S.NotAllowed as e:
                 S.log(f"   {name}: {e} 을 바꿀 허락이 없어 건너뛴다")
                 continue
             for k in knobs:
-                d = data_dir(self.adapter, k, f.get("chunk"), self.wm)
+                d = data_dir(self.adapter, k, f.get("chunk") or self.v.get("layout"), self.wm)
                 oks = [self.measure(f"{k}+{name}.r{i}", self.v["knobs"][k], d, speed)["ok"] for i in range(first, first + times)]
                 S.log(f"   {k}+{name} x{speed:g} 다시 {times}번: 통과 {sum(oks)}")
 
@@ -277,7 +322,7 @@ class Sweep:
         best_knob, best_sp = None, None
         S.apply({**S.BASE})
         for k in knobs:                                          # ① 클러스터 기본값에서 adapter 설정마다
-            sp = self.search(f"{k}+base", self.v["knobs"][k], data_dir(self.adapter, k, None, self.wm), start)
+            sp = self.search(f"{k}+base", self.v["knobs"][k], data_dir(self.adapter, k, self.v.get("layout"), self.wm), start)
             if sp and (best_sp is None or sp > best_sp):
                 best_knob, best_sp = k, sp
         if best_knob is None:
@@ -288,12 +333,15 @@ class Sweep:
             if name == "base":
                 continue
             f = SETTINGS[name]
+            if self.v.get("layout") and f.get("chunk"):
+                S.log(f"   {name}: {self.adapter} 는 재생 폴더 chunk 가 {self.v['layout']} 로 정해져 있어 건너뛴다")
+                continue
             try:
                 S.apply({**S.BASE, **{k: v for k, v in f.items() if k != "chunk"}})
             except S.NotAllowed as e:
                 S.log(f"   {name}: {e} 을 바꿀 허락이 없어 건너뛴다")
                 continue
-            self.search(f"{best_knob}+{name}", self.v["knobs"][best_knob], data_dir(self.adapter, best_knob, f.get("chunk"), self.wm), set_start or best_sp)
+            self.search(f"{best_knob}+{name}", self.v["knobs"][best_knob], data_dir(self.adapter, best_knob, f.get("chunk") or self.v.get("layout"), self.wm), set_start or best_sp)
 
 
 # --- verify ---
@@ -303,7 +351,7 @@ def compare_io(run, rules):
     from cache_sim import CacheSim
     from compare import gpu_blocks, real_labels_open
     from send import prompt, requests
-    io = {"L1": "없음", "lost": "없음", "L2": "load", "store": "store", "dup": "dup"}
+    io = {"L1": "없음", "lost": "없음", "gpu": "없음", "L2": "load", "store": "store", "dup": "dup"}
     cfg = json.loads((SM / "targets/serving-base.json").read_text())
     cfg["lmcache"]["rules"] = rules
     meta = json.loads((run / "requests.json").read_text())
@@ -350,7 +398,7 @@ def verify(adapter):
     if why:
         raise SystemExit("다른 작업이 보여 멈춘다: " + "; ".join(why))
     env = dict(os.environ, NODES=" ".join(c["host"] for c in C.CLIENTS), MAX_SEQS="default", SPEED="0.01", MAX_TOKENS="trace",
-               OUTDIR=f"tune/{adapter}", ADAPTER=adapter)
+               OUTDIR=f"{OUT.relative_to(SM / 'results')}/{adapter}", ADAPTER=adapter)   # 아래 run 과 같은 폴더
     try:
         subprocess.run(["./run_real.sh", name, "alibaba-coder-hot30", "1000"], cwd=SM / "validate", env=env, check=True)
     finally:
@@ -393,6 +441,9 @@ def main():
     ap.add_argument("--rep-start", type=int, default=2, help="--repeat 의 tag 첫 번호(.rN) — 앞서 쓴 번호와 겹치지 않게")
     ap.add_argument("--set-start", type=float, help="클러스터 설정 search 의 첫 배속(기본: adapter 설정의 최대 배속)")
     ap.add_argument("--evict", help="L1 비우기 문턱/비율(LMCache 기본 0.8/0.2). plan 을 시뮬레이터로 다시 낸다(IO 양이 바뀐다)")
+    ap.add_argument("--prefill-tps", type=float, default=0,
+                    help="GPU prefill 속도(token/s) — 주면 load 뒤 prefill 단계마다 그만큼 기다렸다 store 를 보낸다. 결과 폴더에 -p<값>")
+    ap.add_argument("--clients", type=int, help="클라이언트 수(기본: 그 adapter 가 정한 수, 없으면 [[client]] 전부). 같은 trace 구간을 그 대수가 나눠 받는다")
     args = ap.parse_args()
     if args.cmd == "table":
         return table()
@@ -405,7 +456,7 @@ def main():
         raise SystemExit("클러스터가 되돌릴 곳에 있지 않다 — 되돌리면 지금 값을 지운다. 확인하고 맞춘 뒤 다시: " + "; ".join(bad))
     for s in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(s, lambda *_: sys.exit(1))
-    sw = Sweep(args.adapter, args.trace, args.model, args.evict)
+    sw = Sweep(args.adapter, args.trace, args.model, args.evict, args.clients, args.prefill_tps)
     knobs = args.knobs.split(",") if args.knobs else list(sw.v["knobs"])
     try:
         start = on_grid(args.start or START)

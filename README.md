@@ -1,5 +1,20 @@
 # 스토리지 축소 모형
 
+## 기준 버전
+
+이 도구가 맞춰 둔 버전이다. replay 가 내는 IO 는 시뮬레이터 규칙(`cache_sim.py`)이 정하므로, LMCache 를 이 commit 이 아닌 것으로 빌드해도 replay 는 이 commit 의 IO 를 낸다.
+
+| 무엇 | 버전 | 쓰는 곳 |
+|---|---|---|
+| LMCache | `ad1d738` (dev, 2026-10-29) | 시뮬레이터 규칙 `ad1d738` · adapter 빌드 |
+| vLLM | 0.32.0 | 규칙을 실제와 대조할 때만(`tune.py verify`, GPU 필요). replay 는 vLLM 없이 돈다 |
+| NIXL | 1.5.1 로 대조. 1.3.0 이상이면 된다 | `nixl_store_dynamic` · `nixl_native` |
+| 3FS | 클러스터에 깔린 것 | |
+
+규칙 대조(실제 vLLM + LMCache 와 chunk 단위): **같다**. alibaba-coder-hot30 788 request · Qwen3-14B · hf3fs · client 3대, 비교 창의 3FS IO 일치 99.49% · load +1.2% · store +0.0% · lookup key +0.1% (통과 기준: 일치 95% 이상 · load -5% 에서 +7% · store ±2% · lookup ±2%)
+
+LMCache 를 올릴 때: 바뀐 commit 중 IO(lookup · load · store · L1 비우기 · prefetch 들이기)에 닿는 것을 보고 → `cache_sim.py` 규칙 · `driver.py` 를 고치고 → Spark 에서 `tune.py verify` → 이 표를 고친다.
+
 ## 왜 만드나
 
 실제 서비스 클러스터는 우리 손에 없고, 있어도 운영 중이라 실험할 수 없다.
@@ -80,7 +95,7 @@ replay 는 실행마다 이 장비의 `driver.py` 를 다른 클라이언트의 
 
 1. 가져갈 것: 이 저장소, 공개 trace, 클라이언트마다 LMCache 빌드
    - trace: `git clone https://github.com/alibaba-edu/qwen-bailian-usagetraces-anon traces/alibaba` (Git LFS). Mooncake trace 는 Mooncake 저장소의 `FAST25-release/traces` 를 `traces/mooncake/` 에 둔다(sweep 은 Alibaba 만 쓴다)
-   - LMCache: upstream `6e69015`(10-17) 이후 하나에 adapter 셋(`nixl_store_dynamic` · `nixl_native` · `hf3fs`)이 다 있다. 그 클러스터의 3FS 라이브러리(`libhf3fs_api_shared`)로 hf3fs 확장까지 빌드해 `[[client]] python` 의 venv 에 둔다. adapter 마다 빌드를 따로 두었으면 `[builds.<adapter>]` 에 `python` · `pythonpath` 를 적는다. 클라이언트마다 같은 빌드여야 한다(replay 가 지문으로 견준다)
+   - LMCache: "기준 버전"의 commit 하나에 adapter 셋(`nixl_store_dynamic` · `nixl_native` · `hf3fs`)이 다 있다(upstream `6e69015` 부터). 그 클러스터의 3FS 라이브러리(`libhf3fs_api_shared`)로 hf3fs 확장까지 빌드해 `[[client]] python` 의 venv 에 둔다. adapter 마다 빌드를 따로 두었으면 `[builds.<adapter>]` 에 `python` · `pythonpath` 를 적는다. 클라이언트마다 같은 빌드여야 한다(replay 가 지문으로 견준다)
 2. `cp clusters/TEMPLATE.toml clusters/<이름>.toml` 하고 `[access]` 를 채운다. 비밀번호는 파일 경로만 적는다(권한 600, 저장소 밖). 원격에서 돌릴 계정이 ssh 계정과 다르면 `runs_as`
 3. `SM_CLUSTER=<이름> python3 cluster.py discover <이름>` — admin_cli(`list-nodes` · `list-clients` · `list-chains` · FUSE 템플릿 · storage 설정)와 각 노드(RDMA 포트가 ACTIVE 인 NIC · NVMe · 마운트 · python · 도구 사본 · FUSE 서비스와 로그)에서 찾은 값으로 초안을 다시 내고, 지금 FUSE 템플릿을 되돌릴 곳으로 받아 둔다. admin_cli · admin_host 가 비어 있으면 3FS 기본 설치 경로와 이 장비로 해 본다
 4. 초안의 빈칸과 `# 확인` 을 사람이 채운다. `[allow]` 는 클러스터 주인에게 묻는다. 디스크 · 링크 천장은 선택이다 — 적으면 사용률(%)이 나오고, 사양값이면 그렇게 적어 둔다

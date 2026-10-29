@@ -37,6 +37,10 @@ LMCache 판에 따라 바뀐 규칙 (lmcache.rules, 없으면 a44d5e5) — 8d7d2
   8d7d2c4  - L2 lookup 은 request 의 청크 전부를 묻는다(prefetch_controller: "full keys"). 적중은 L1 · L2 어느 쪽에든 있는 청크가
              청크 0 부터 이어지는 만큼이고, 청크마다 L1 에 있으면 L1, 없으면 L2 에서 가져온다(DefaultPrefetchPolicy)
            - LMCache 적중이 0 이어도 vLLM 적중 토큰이 계산된 토큰에 들어간다 → 마지막 완전한 청크까지 저장한다
+  ad1d738  8d7d2c4 에 더해 60538a0(10-17, #5383): GPU(vLLM APC)가 가진 앞부분 c0 = GPU 적중 // 청크 는 묻지도 읽지도 않고
+             L1 · L2 recency 만 갱신한다(touch, IO 없음). 적중은 c0 부터 L1 · L2 어느 쪽에든 이어지는 만큼이고, 서버가 c0 을 더해
+             절대값으로 알린다 → 저장도 c0 + 적중 끝에서 시작해, L2 에 없는 GPU 앞부분은 다시 저장하지 않는다(8d7d2c4 는 적중이
+             0 부터라 그런 청크를 저장했다). 라벨 gpu = GPU 가 가진 앞부분(3FS IO 없음)
 
 요청 하나의 결과는 청크마다 라벨 하나:
   L1     L1 적중 (L2 에 묻지 않음)
@@ -49,7 +53,7 @@ LMCache 판에 따라 바뀐 규칙 (lmcache.rules, 없으면 a44d5e5) — 8d7d2
 import collections
 import math
 
-LABELS = ("L1", "L2", "store", "dup", "lost")
+LABELS = ("L1", "L2", "store", "dup", "lost", "gpu")
 
 
 class CacheSim:
@@ -140,21 +144,24 @@ class CacheSim:
         hit = min(hit, (L - 1) // self.block)
         h = hit * self.block
 
-        # LMCache lookup: L1 prefix → L2 prefix
+        # LMCache lookup: (ad1d738 은 GPU 가 가진 앞부분 s0 를 건너뛰고) L1 prefix → L2 prefix
+        s0 = h // self.chunk if self.rules == "ad1d738" else 0
+        if s0:
+            self._l1_touch(ck[:s0])                           # 그 앞부분은 lookup 때 recency 만 갱신한다
         p1 = 0
-        while p1 < n and ck[p1] in self.l1:
+        while s0 + p1 < n and ck[s0 + p1] in self.l1:
             p1 += 1
         p2 = 0
         if self.rules == "a44d5e5":                           # L1 앞부분 뒤를 L2 에 묻는다
-            while p1 + p2 < n and ck[p1 + p2] in self.l2:
+            while s0 + p1 + p2 < n and ck[s0 + p1 + p2] in self.l2:
                 p2 += 1
         else:                                                 # 청크 전부를 묻고 L1 · L2 를 합쳐 앞에서부터
-            while p1 + p2 < n and (ck[p1 + p2] in self.l2 or ck[p1 + p2] in self.l1):
+            while s0 + p1 + p2 < n and (ck[s0 + p1 + p2] in self.l2 or ck[s0 + p1 + p2] in self.l1):
                 p2 += 1
-        ret = (p1 + p2) * self.chunk
+        ret = (s0 + p1 + p2) * self.chunk                     # 서버는 적중을 절대값(s0 포함)으로 알린다
         # L2 적중 범위 중 L1 에 남아 있는 청크는 L1 에서 가져오고, 나머지만 L2 에서 읽는다.
-        # GPU 적중과 무관하게 읽는다 (요청이 들어올 때 prefetch 한다)
-        from_l2 = [ck[j] not in self.l1 for j in range(p1, p1 + p2)]
+        # 8d7d2c4 까지는 GPU 적중과 무관하게 읽는다 (요청이 들어올 때 prefetch 한다)
+        from_l2 = [ck[j] not in self.l1 for j in range(s0 + p1, s0 + p1 + p2)]
         load = sum(from_l2)
 
         # GPU 블록: 적중 블록은 사용 중으로, 나머지는 free 큐 앞에서 꺼낸다
@@ -183,14 +190,16 @@ class CacheSim:
             steps.append(min(self.step_tokens, left))
             left -= steps[-1]
         steps += [1] * (max_tokens - 1)
-        batches, end, sched = [], p1 + p2, 0
+        batches, end, sched = [], s0 + p1 + p2, 0
+        after = []                                           # 묶음마다 그때까지 새로 계산한 토큰 (GPU 계산 시간 넣기용)
         for st in steps:
             sched += st
             new_end = min(n, (sched + base) // self.chunk)
             if new_end > end:
                 batches.append(ck[end:new_end])
+                after.append(sched)
                 end = new_end
-        labels = ["L1"] * p1 + ["L2" if x else "lost" for x in from_l2]
+        labels = ["gpu"] * s0 + ["L1"] * p1 + ["L2" if x else "lost" for x in from_l2]
         stored = [k for b in batches for k in b]
         for b in batches:                                    # 단계마다 저장 작업 하나. adapter 는 이미 가진 key 를 건너뛰고,
             full = False                                     # 용량을 넘으면 그 작업의 나머지를 건너뛴다
@@ -224,7 +233,7 @@ class CacheSim:
             # (thinking 전체 실행: 요청 282 가 L1 적중으로 쓴 청크가 282 도중 비우기에서 빠졌다)
             # 반면 L2 적중 범위 안에서 L1 에 있던 청크는 L2 읽기가 끝날 때까지 함께 잠겨 있다
             # (thinking 전체 실행: 요청 973 이 L1 에서 가져온 청크 46~79 는 도중 비우기에서 살아남았다)
-            held = {ck[j] for j, x in zip(range(p1, p1 + p2), from_l2) if not x} if load else set()
+            held = {ck[j] for j, x in zip(range(s0 + p1, s0 + p1 + p2), from_l2) if not x} if load else set()
             self._evict_check(extra_mem=inflight, locked=held)
         # 앞 단계의 저장 청크는 요청 도중 목록에 들어가고, 요청이 끝날 때 touch 가 일어난 뒤
         # 마지막 단계의 저장 청크가 들어간다 (coder 실험: 마지막 단계 청크가 LRU 에서 가장 최근)
@@ -240,5 +249,6 @@ class CacheSim:
         if mode == "after":                                  # 응답 뒤, 3FS 저장이 끝나기 전: 저장 청크는 목록에 있고 잠겨 있다
             self._evict_check(locked=set(stored))
         # mode == "next": 다음 요청이 시작할 때 그 요청의 검사에서 비운다
-        return {"labels": labels, "gpu_hit_tokens": h, "p1": p1, "p2": p2, "loaded": load, "store_batches": batches,
-                "lookup_from": p1 if self.rules == "a44d5e5" else 0}         # L2 lookup 이 묻는 첫 청크
+        return {"labels": labels, "gpu_hit_tokens": h, "p1": p1, "p2": p2, "s0": s0, "loaded": load, "store_batches": batches,
+                "store_after_tokens": after,
+                "lookup_from": p1 if self.rules == "a44d5e5" else s0}        # L2 lookup 이 묻는 첫 청크

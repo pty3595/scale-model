@@ -393,9 +393,16 @@ def replay(args) -> dict:
     size = plan["chunk_bytes"]
     align = args.l1_align or cal["shape"]["l1_align_bytes"]
     slots_n = args.slots
-    # --max-batch 0: 나누지 않는다 — LMCache prefetch 처럼 request 하나의 load 가 task 하나. 내용은 안 보니 슬롯이 load 영역 하나를 함께 쓴다
-    shared = args.max_batch == 0
-    mb = max([len(e[2]) for e in events] + [1]) if shared else args.max_batch
+    # prefetch 들이기: slots = 동시 --slots 개(LMCache 8d7d2c4 까지), watermark = L1 바이트 기준(a6accee6, 10-21 부터 — plan 이 정한다).
+    #   watermark: 들어와 있는 요청이 없거나, (staging + lookup 중 최악) < watermark x L1 이고 L1 남은 자리 - lookup 중 최악 >= 이 요청의 최악.
+    #   staging = 읽는 중인 load + 진행 중인 store, 최악 = 묻는 chunk 를 모두 L2 에서 읽는 바이트 (prefetch_controller._can_admit_new_prefetch)
+    adm = plan.get("admission", "slots")
+    l1_total = plan.get("l1_bytes", 0)
+    wm_bytes = plan.get("prefetch_watermark", 0.5) * l1_total
+    # --max-batch 0: 나누지 않는다 — LMCache prefetch 처럼 request 하나의 load 가 task 하나. 내용은 안 보니 슬롯이 load 영역 하나를 함께 쓴다.
+    # watermark 면 동시 요청 수가 정해지지 않아 load 영역 하나를 함께 쓴다
+    shared = args.max_batch == 0 or adm == "watermark"
+    mb = max([len(e[2]) for e in events] + [1]) if args.max_batch == 0 else args.max_batch
     sb = max([len(b) for e in events for b in e[3]], default=1)
     os.makedirs(args.data_dir, exist_ok=True)
 
@@ -404,13 +411,16 @@ def replay(args) -> dict:
     n_regions = 1 if shared else slots_n
     l1_buffer = lm["make_aligned_tensor"](n_regions * region + sb * size, align)
     l1_desc = lm["create_l1_memory_desc"](l1_buffer, align_bytes=align)
-    spec = (args.adapter_json.replace("{dir}", args.data_dir) if args.adapter_json
-            else adapter_json(cal, args.data_dir, args.backend_param))
+    # {rdir}: 마운트를 거치지 않는 adapter(raw_hf3fs)는 3FS 루트 기준 경로를 받는다
+    spec = (args.adapter_json.replace("{dir}", args.data_dir)
+            .replace("{rdir}", os.path.relpath(args.data_dir, cal["adapter"]["backend_params"]["mount_point"]))
+            if args.adapter_json else adapter_json(cal, args.data_dir, args.backend_param))
     adapter = build_adapter(lm, spec, l1_desc)
     mk = lm["make_object_keys"]
     keys_of = lambda idxs: [mk(1, key_offset=i)[0] for i in idxs]
+    STORE = -1                                   # store 영역(모든 store 가 함께 쓴다)
     objs_of = lambda slot, n: lm["make_memory_objects"](l1_buffer, n, size,
-                                                        n_regions * region if slot == slots_n else 0 if shared else slot * region)
+                                                        n_regions * region if slot == STORE else 0 if shared else slot * region)
 
     def log(msg):
         if not args.quiet:
@@ -429,7 +439,7 @@ def replay(args) -> dict:
     out = {"host": socket.gethostname(), "mode": "replay", "client_index": args.client_index,
            "lmcache": str(pkg), "code": code, "l1_align": align,
            "trace": plan["trace"], "speed": plan["speed"], "events": len(events),
-           "prepopulate_chunks": len(prepop)}
+           "prepopulate_chunks": len(prepop), "admission": adm, "prefill_tps": args.prefill_tps}
     store_done = {}
 
     STALL_S = 180      # 이만큼 아무 것도 끝나지 않으면 멈춘 것으로 본다 (10-21: 먼저 끝난 클라이언트가 남의 store 를 깨뜨림 · 3FS 가 참)
@@ -476,25 +486,51 @@ def replay(args) -> dict:
                 time.sleep(gap)
         base = time.perf_counter()
 
-        slots = [None] * slots_n            # lookup·load 중인 요청
+        slots = [None] * slots_n if adm == "slots" else []      # lookup·load 중인 요청
         stores = {}                         # 진행 중인 store: task id -> (보낸 시각, chunk 수)
+        later = []                          # GPU 계산을 기다리는 store 묶음 (--prefill-tps): (보낼 시각, chunk 들)
+
+        def new_slot(ev, now):
+            return {"due": ev[0], "start": now, "look": ev[1], "want": set(ev[2]), "batches": ev[3],
+                    "after": ev[6] if len(ev) > 6 else [0] * len(ev[3]),
+                    "loadq": None, "found": [], "task": None, "lookup_s": 0.0, "loaded": 0, "pending": 0}
+
+        def can_admit(ev):
+            live = [x for x in slots if x]
+            if not live:
+                return True
+            lookup_b = sum(len(x["look"]) for x in live if x["loadq"] is None) * size
+            staging = (sum(x["pending"] for x in live) + sum(n for _, n in stores.values())) * size
+            used = (ev[5] if len(ev) > 5 else 0) * l1_total + staging
+            return staging + lookup_b < wm_bytes and l1_total - used - lookup_b >= len(ev[1]) * size
         nxt = 0
         records, store_records = [], []
         missed = max_stores = 0
         layout = lm["layout_desc"]
         last_prog = time.perf_counter()
         # 끝 시각은 그 자리에서 다시 잰다 — adapter 가 lock 을 쥐고 동기 stat 을 하는 동안 adapter 호출이 막혀 루프 첫머리의 now 가 낡는다
-        while nxt < len(events) or any(slots) or stores:
+        while nxt < len(events) or any(slots) or stores or later:
             now = time.perf_counter() - base
             progressed = False
-            # 때가 된 요청을 빈 슬롯에 올린다
-            for si in range(slots_n):
-                if slots[si] is None and nxt < len(events) and events[nxt][0] <= now:
-                    due, look, loads, batches = events[nxt][:4]
-                    slots[si] = {"due": due, "start": now, "look": look, "want": set(loads), "batches": batches,
-                                 "loadq": None, "found": [], "task": None, "lookup_s": 0.0, "loaded": 0}
+            # 때가 된 요청을 들인다 — 빈 슬롯에(slots) 또는 L1 바이트가 허락하는 만큼 차례대로(watermark)
+            if adm == "slots":
+                for si in range(slots_n):
+                    if slots[si] is None and nxt < len(events) and events[nxt][0] <= now:
+                        slots[si] = new_slot(events[nxt], now)
+                        nxt += 1
+                        progressed = True
+            else:
+                slots = [x for x in slots if x]
+                while nxt < len(events) and events[nxt][0] <= now and can_admit(events[nxt]):
+                    slots.append(new_slot(events[nxt], now))
                     nxt += 1
                     progressed = True
+            # GPU 계산이 끝난 store 묶음을 보낸다
+            while later and later[0][0] <= now:
+                _, b = later.pop(0)
+                stores[adapter.submit_store_task(keys_of(b), objs_of(STORE, len(b)))] = (time.perf_counter() - base, len(b))
+                max_stores = max(max_stores, len(stores))
+                progressed = True
             # 끝난 store
             for tid, r in adapter.pop_completed_store_tasks().items():
                 t0, n = stores.pop(tid)
@@ -517,8 +553,13 @@ def replay(args) -> dict:
                     else:                                      # load 끝: unlock, store 를 보내고 슬롯을 비운다
                         if sl["found"]:
                             adapter.submit_unlock(sl["found"])
-                        for b in sl["batches"]:
-                            stores[adapter.submit_store_task(keys_of(b), objs_of(slots_n, len(b)))] = (time.perf_counter() - base, len(b))
+                        if args.prefill_tps:                   # prefill 단계마다 GPU 가 그만큼 계산한 뒤에 그 단계의 store 를 보낸다
+                            t_done = time.perf_counter() - base
+                            later.extend((t_done + a / args.prefill_tps, b) for b, a in zip(sl["batches"], sl["after"]))
+                            later.sort(key=lambda x: x[0])
+                        else:
+                            for b in sl["batches"]:
+                                stores[adapter.submit_store_task(keys_of(b), objs_of(STORE, len(b)))] = (time.perf_counter() - base, len(b))
                         max_stores = max(max_stores, len(stores))
                         records.append({"due": sl["due"], "late": sl["start"] - sl["due"], "load_s": time.perf_counter() - base - sl["start"],
                                         "lookup_s": sl["lookup_s"], "looked": len(sl["look"]), "found": len(sl["found"]),
@@ -538,15 +579,18 @@ def replay(args) -> dict:
                     sl["found"] = [k for i, k in enumerate(keys) if res.test(i)]
                     ld = [k for k in sl["found"] if k.kv_rank in sl["want"]]
                     sl["loadq"] = [ld[i:i + mb] for i in range(0, len(ld), mb)]
+                    sl["pending"] = len(ld)
                 else:
                     sl["loaded"] += sum(1 for i in range(len(keys)) if res.test(i))
+                    sl["pending"] -= len(keys)
                 sl["task"] = None
                 progressed = True
             if progressed:
                 last_prog = time.perf_counter()
             else:
                 if time.perf_counter() - last_prog > STALL_S:
-                    out["stalled"] = {"stores": len(stores), "slots": sum(1 for x in slots if x), "events_left": len(events) - nxt}
+                    out["stalled"] = {"stores": len(stores), "slots": sum(1 for x in slots if x), "events_left": len(events) - nxt,
+                                      "later": len(later)}
                     log(f"[replay] {STALL_S}초 동안 진행이 없어 멈춘다: {out['stalled']}")
                     break
                 time.sleep(0.0005)
@@ -605,6 +649,8 @@ def main():
     ap.add_argument("--procs", type=int, default=1, help="이 클라이언트의 event 를 나눠 맡는 프로세스 수 (replay 전용)")
     ap.add_argument("--proc-index", type=int, default=0, help="그중 이 프로세스의 번호 (replay 전용)")
     ap.add_argument("--max-batch", type=int, default=64, help="load 한 번에 보낼 최대 chunk 수, 0 이면 request 당 task 하나 (replay 전용)")
+    ap.add_argument("--prefill-tps", type=float, default=0,
+                    help="GPU prefill 속도(token/s). 주면 load 가 끝난 뒤 prefill 단계마다 그만큼 기다렸다가 그 단계의 store 를 보낸다 (replay 전용, 0 이면 바로)")
     ap.add_argument("--load-rdonly", action="store_true", help="load 할 파일을 읽기 전용으로 연다 (replay 전용)")
     ap.add_argument("--adapter-json", default=None,
                     help="calibration 의 adapter 대신 쓸 adapter JSON. {dir} 는 --data-dir 로 바뀐다 (replay 전용). 예: hf3fs")

@@ -309,7 +309,7 @@ def discover(name):
     print(f"{PATH.name} 의 [access] · admin_cli({t['admin_host']}: {t['admin_cli']}) 로 찾는다. cluster_id = {cid or '못 찾음'}")
     nodes = [l.split() for l in admin("list-nodes").splitlines()[1:] if l.split()]
     stor = sorted((int(f[0]), f[3]) for f in nodes if f[1] == "STORAGE")
-    clients = sorted({f[8] for f in (l.split() for l in admin("list-clients").splitlines()[1:]) if len(f) > 8})
+    clients = sorted({f[8] for f in (l.split() for l in admin("list-clients").splitlines()[1:]) if len(f) > 8 and f[8] != "N/A"})   # N/A: FUSE 가 아닌 클라이언트(raw_hf3fs connector 등)
     res = lambda h: (subprocess.run(["getent", "hosts", h], capture_output=True, text=True).stdout.split() or [""])[0]
 
     def probe(h, client=False):

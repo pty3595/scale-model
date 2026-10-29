@@ -76,7 +76,7 @@ def speed_plan(fam_dir, kind, speed):
     """배속 plan 파일을 만들어 경로를 돌려준다(있으면 그대로)"""
     out = Path(fam_dir) / f"{kind}-x{speed:g}.json"
     base = json.loads((Path(fam_dir) / "base.json").read_text())
-    if base["clients"] != len(C.CLIENTS):
+    if base["clients"] > len(C.CLIENTS):
         raise SystemExit(f"{fam_dir} 는 클라이언트 {base['clients']}대로 계산했다 — 이 클러스터는 {len(C.CLIENTS)}대")
     if not out.exists():
         p = P.at_speed(variant(base, kind), speed, CAL)

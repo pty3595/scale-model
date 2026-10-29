@@ -16,4 +16,12 @@ for f in $(find /dev/shm -maxdepth 1 -name 'hf3fs-iov-*' -user "$(id -u)" -mmin 
   [ -n "$links" ] && rm -f $links
   rm -f "$f"
 done
-echo "$(hostname) iov $n 개 $((bytes >> 20)) MiB $([ "$DRY" = -n ] && echo '지울 것' || echo '지움')"
+# 가리키는 /dev/shm 파일이 이미 없는 이 계정의 iov 링크 — FUSE 가 그 메모리를 쥔 채 남는다(10-29: 한 노드에 링크 296 개 · FUSE RSS 30 GB)
+d=0
+for l in $(find $M/3fs-virt/iovs -maxdepth 1 -type l -user "$(id -u)" 2>/dev/null); do
+  [ -e "$(readlink "$l")" ] && continue
+  d=$((d + 1))
+  [ "$DRY" = -n ] && { echo "$l → 없는 파일"; continue; }
+  rm -f "$l"
+done
+echo "$(hostname) iov $n 개 $((bytes >> 20)) MiB · 끊긴 링크 $d 개 $([ "$DRY" = -n ] && echo '지울 것' || echo '지움')"

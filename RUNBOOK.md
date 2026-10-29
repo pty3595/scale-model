@@ -28,7 +28,8 @@
 1. 계획을 줄이지 않는다 — adapter · knob · 클러스터 설정 · trace · 모델을 빼지 않는다. 설치가 어렵다고 adapter 를 건너뛰지 않는다. 막히면 그 자리에서 멈추고 보고한다
 2. 따로 측정 스크립트 · 모니터를 만들지 않는다. 필요한 숫자(망 버림 · 재전송 포함)는 도구가 실행마다 이미 잰다("도구가 재는 것")
 3. 코드(`*.py` · `*.sh`)와 `calibration.json` 을 고치지 않는다. 도구가 에러로 멈추면 고치거나 우회하지 않고 "문제가 생기면"의 표대로 한다
-4. 클러스터 설정을 바꾸는 명령을 직접 치지 않는다 — `admin_cli set-config` · `hot-update-config` · `set-layout`, `systemctl restart`, FUSE 다시 띄우기
+4. 클러스터 설정을 바꾸는 명령을 직접 치지 않는다 — `admin_cli set-config` · `hot-update-config` · `set-layout`, `systemctl restart`, FUSE 다시 띄우기(`tune/fuse_write.py` 도).
+   FUSE 쓰기 admission · 쓰기 묶음은 FUSE 를 다시 띄워야 바뀌고 그 노드의 다른 사용자 마운트도 끊겨서 계획에 넣지 않았다(`w32` · `src-w32`)
 5. `clusters/<이름>.toml` 의 `[access]` · `[allow]` · `[home]` · `[ref]` 를 고치지 않는다. 비밀번호를 파일이나 대화에 적지 않는다(`[builds]` 는 "설치"대로 채운다)
 6. 3FS 에서 아무것도 지우지 않는다(`rm` 을 쓰지 않는다). 재생 폴더는 도구가 지운다
 7. 다른 사람이 클러스터를 쓰는 중이면 측정을 띄우지 않는다. 측정을 두 개 함께 돌리지 않는다
@@ -82,7 +83,7 @@
 `<venv>` 는 `[[client]] python` 의 venv 폴더(예: `$HOME/venv-lmcache`)다. 한 단계가 실패하면 출력을 그대로 보고하고 멈춘다.
 설치 명령은 적힌 그대로 친다. 이 절에서만 `cd` 를 쓴다.
 
-1. NIXL — `nixl_store_dynamic` · `nixl_native` 가 쓴다. 버전은 정하지 않는다(LMCache `6e69015` 는 1.3.0 이상이면 된다). HF3FS plugin 은 cu13 wheel 에만 있어 셋을 다 깐다
+1. NIXL — `nixl_store_dynamic` · `nixl_native` 가 쓴다. 버전은 정하지 않는다(LMCache 는 1.3.0 이상이면 된다). HF3FS plugin 은 cu13 wheel 에만 있어 셋을 다 깐다
 
    ```bash
    <venv>/bin/pip install -U nixl nixl-cu12 nixl-cu13
@@ -102,28 +103,28 @@
    curl -fsSL -o $HOME/nixl-include/nixl_types.h https://raw.githubusercontent.com/ai-dynamo/nixl/v<nixl 버전>/src/api/cpp/nixl_types.h
    ```
 
-3. LMCache `6e69015` 를 adapter 셋 모두 넣어 빌드한다 — 시뮬레이터 규칙이 이 버전에 맞춰져 있다. 한 노드에서 빌드하고, 다른 클라이언트에는 같은 경로로 복사한다(빌드 지문이 같아야 replay 가 돈다)
+3. LMCache 를 README 의 "기준 버전" commit 으로 adapter 셋 모두 넣어 빌드한다 — 시뮬레이터 규칙이 그 commit 에 맞춰져 있다(아래 `<commit>`). 한 노드에서 빌드하고, 다른 클라이언트에는 같은 경로로 복사한다(빌드 지문이 같아야 replay 가 돈다)
 
    ```bash
-   git clone https://github.com/LMCache/LMCache.git $HOME/LMCache-6e69015
-   git -C $HOME/LMCache-6e69015 checkout 6e69015
+   git clone https://github.com/LMCache/LMCache.git $HOME/LMCache-<commit>
+   git -C $HOME/LMCache-<commit> checkout <commit>
    ```
 
-   빌드는 `$HOME/LMCache-6e69015` 폴더에서 한 줄로 친다. `<absl>` · `<3fs lib>` 는 hf3fs 를 처음 빌드할 때 쓴 값(Abseil 헤더 폴더 · `libhf3fs_api_shared.so` 가 있는 폴더, 보통 `/opt/3fs/lib`)이다. python 이 3.12 가 아니면 `python3.12` 를 그 버전으로 바꾼다
+   빌드는 `$HOME/LMCache-<commit>` 폴더에서 한 줄로 친다. `<absl>` · `<3fs lib>` 는 hf3fs 를 처음 빌드할 때 쓴 값(Abseil 헤더 폴더 · `libhf3fs_api_shared.so` 가 있는 폴더, 보통 `/opt/3fs/lib`)이다. python 이 3.12 가 아니면 `python3.12` 를 그 버전으로 바꾼다
 
    ```bash
-   NO_GPU_EXT=1 BUILD_WITH_HF3FS=1 BUILD_HF3FS=1 HF3FS_INCLUDE_DIR=<absl> HF3FS_LIB_DIR=<3fs lib> BUILD_WITH_NIXL=1 NIXL_INCLUDE_DIR=$HOME/nixl-include NIXL_LIBRARY_DIR=<venv>/lib/python3.12/site-packages/.nixl_cu13.mesonpy.libs <venv>/bin/python setup.py build_ext --inplace > $HOME/lmcache-6e69015-build.log 2>&1
+   NO_GPU_EXT=1 BUILD_WITH_HF3FS=1 BUILD_HF3FS=1 HF3FS_INCLUDE_DIR=<absl> HF3FS_LIB_DIR=<3fs lib> BUILD_WITH_NIXL=1 NIXL_INCLUDE_DIR=$HOME/nixl-include NIXL_LIBRARY_DIR=<venv>/lib/python3.12/site-packages/.nixl_cu13.mesonpy.libs <venv>/bin/python setup.py build_ext --inplace > $HOME/lmcache-<commit>-build.log 2>&1
    ```
 
-   `$HOME/lmcache-6e69015-build.log` 에 `Using explicitly requested storage backend: hf3fs` 와 `...: nixl` 두 줄이 있어야 한다. 그다음 `clusters/<이름>.toml` 에 적는다
+   `$HOME/lmcache-<commit>-build.log` 에 `Using explicitly requested storage backend: hf3fs` 와 `...: nixl` 두 줄이 있어야 한다. 그다음 `clusters/<이름>.toml` 에 적는다
 
    ```toml
    [builds.hf3fs]
-   pythonpath = "$HOME/LMCache-6e69015"
+   pythonpath = "$HOME/LMCache-<commit>"
    [builds.nixl_store_dynamic]
-   pythonpath = "$HOME/LMCache-6e69015"
+   pythonpath = "$HOME/LMCache-<commit>"
    [builds.nixl_native]
-   pythonpath = "$HOME/LMCache-6e69015"
+   pythonpath = "$HOME/LMCache-<commit>"
    ```
 
 4. pwrite shim — `dram_zc` 가 붙은 knob 이 쓴다(L1 이 2 GiB 를 넘으면 NIXL HF3FS plugin 이 등록에 실패하는 것을 피한다). 모든 클라이언트에서
@@ -170,22 +171,30 @@
 | 2 | `SM_CLUSTER=<이름> python3 cluster.py discover <이름>` | 초안. 빈칸과 `# 확인` 줄을 목록으로 사용자에게 보여 주고 사람이 채운다. 추측해서 채우지 않는다 |
 | 3 | `python3 cluster.py check` | 마지막 줄 "통과" |
 | 4 | `python3 tune/settings.py home` | "HOME 과 같다" |
-| 5 | `python3 ceiling.py` | `clusters/<이름>-ceiling.json`. 읽기 · 쓰기 합(GiB/s)을 보고한다. storage 설정이 바뀐 뒤에만 다시. fio-usrbio · 엔진이 없다고 하면 "설치" 5 |
+| 5 | `python3 ceiling.py` | `clusters/<이름>-ceiling.json`. 데이터는 storage RAM 합의 두 배로 저절로 정해진다. fio 읽기 · 쓰기 합과 같은 구간의 storage 디스크 읽기 · 쓰기를 함께 보고한다. `!! 읽기에서 storage 디스크가 fio 보다 …` 가 나오면 캐시에서 읽은 것이다 — 그 줄과 storage 데이터 폴더의 파일시스템(`stat -f -c %T <폴더>`, ZFS 면 캐시를 거친다)을 보고한다. storage 설정이 바뀐 뒤에만 다시. fio-usrbio · 엔진이 없다고 하면 "설치" 5 |
 
 ## 측정
 
 ### 계획
 
-`python3 tune/agent.py plan` 이 단계마다 끝 · 남음 · 기다림을 보인다. 단계는 아래 순서이고, 앞 단계 결과로 다음 단계의 knob · 설정을 도구가 고른다.
+계획은 셋 중 하나다. 사용자가 쓸 수 있는 시간을 말하면 그에 맞는 것을 고르고, 말하지 않으면 묻는다. 고른 계획은 `python3 tune/agent.py plan --profile <이름>` 으로 한 번 정하면 `next` · `report` 가 그것을 쓴다.
 
-| 단계 | 무엇 | search 수 |
-|---|---|---|
-| 1 knob 전부 | 기준 상황(coder x Qwen3-14B, 클러스터 `base`)에서 adapter 셋의 knob 전부 | 21 |
-| 2 클러스터 설정 | adapter 마다 1 의 가장 좋은 knob 에서 클러스터 설정 다섯(`[allow]` 가 없는 것은 도구가 뺀다) | 15 이하 |
-| 3 경계 확인 | adapter 마다 가장 좋은 조합의 최대 배속과 그 위 한 칸을 두 번씩 더 | 실행 12 |
-| 4 다른 trace · 모델 | 아래 다섯 상황에서 adapter 마다 1 의 가장 좋은 knob | 15 |
+| 계획 | 언제 | 기준 상황(coder x Qwen3-14B) knob | 클러스터 설정 | 다른 상황 | 어림 |
+|---|---|---|---|---|---|
+| `short` | 반나절 | adapter 마다 둘(문서 예시 · Spark 에서 가장 좋았던 것) | 없음 | Llama(key 가장 큼), 가장 좋은 knob | 2-7시간 |
+| `normal` | 하루 | adapter 셋의 knob 전부(21) | 가장 좋은 knob 에서 다섯 | DeepSeek · Llama · api(B), 가장 좋은 knob | 11-34시간 |
+| `long` | 이틀 넘게 | knob 전부 | 다섯 | normal + chat(A) · coder 60분, DeepSeek · Llama 는 knob 전부 | 22-66시간 |
 
-search 하나가 1-2시간이라 계획 전체는 며칠 걸린다. 사람이 끊지 않는 한 계획이 다 끝날 때까지 이어 간다.
+`python3 tune/agent.py plan` 이 단계마다 끝 · 남음 · 기다림과 남은 시간 어림을 보인다. 단계는 아래 순서이고, 앞 단계 결과로 다음 단계의 knob · 설정을 도구가 고른다.
+
+| 단계 | 무엇 |
+|---|---|
+| 1 knob | 기준 상황(클러스터 `base`)에서 adapter 셋의 knob — 계획마다 다르다 |
+| 2 클러스터 설정 | adapter 마다 1 의 가장 좋은 knob 에서 클러스터 설정(`[allow]` 가 없는 것은 도구가 뺀다). `short` 에는 없다 |
+| 3 경계 확인 | adapter 마다 가장 좋은 조합의 최대 배속과 그 위 한 칸을 두 번씩 더 |
+| 4 다른 상황 | 계획의 다른 trace · 모델 |
+
+사람이 끊지 않는 한 고른 계획이 다 끝날 때까지 이어 간다. 계획을 줄이거나 단계를 건너뛰지 않는다 — 시간이 모자라면 사용자에게 더 짧은 계획으로 바꿀지 묻는다.
 
 ### 되풀이
 

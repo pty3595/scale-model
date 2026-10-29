@@ -78,6 +78,8 @@ def main():
     ap.add_argument("--stripe", type=int, default=None,
                     help="재생 폴더의 stripe (기본: 3FS 기본값, calibration.json layout.default_stripe). A/B 에서 스토리지 쪽 설정으로 쓴다")
     ap.add_argument("--chunk", type=int, default=None, help="재생 폴더의 chunk 크기(바이트). --stripe 와 함께 준다")
+    ap.add_argument("--prefill-tps", type=float, default=0,
+                    help="GPU prefill 속도(token/s). 주면 driver 가 load 뒤 prefill 단계마다 그만큼 기다렸다가 store 를 보낸다 (0 이면 바로)")
     ap.add_argument("--max-batch", type=int, default=64, help="load 한 번에 보낼 최대 chunk 수, 0 이면 request 당 task 하나 — LMCache prefetch 와 같다 (driver 로 넘긴다)")
     ap.add_argument("--disk-f", type=float, default=1.0,
                     help="이 실행에 건 디스크 상한 배율(throttle.sh stor). 사용률 분모를 그만큼 줄인다")
@@ -174,7 +176,7 @@ def replay_one(plan_path: Path, out: Path, args) -> None:
             cmd = (f"cd {c['workdir']} && {args.prefix} {args.python or c['python']} driver.py --mode replay --schedule {remote_plan} --calibration {REMOTE_CAL} "
                    f"--client-index {i} --procs {args.procs} --proc-index {j} "
                    f"--data-dir {data_dir} --slots {args.slots} --start-at {start_at} "
-                   f"--max-batch {args.max_batch} --quiet --out /tmp/scale-model-replay-{c['host']}-{j}.json"
+                   f"--max-batch {args.max_batch} --prefill-tps {args.prefill_tps} --quiet --out /tmp/scale-model-replay-{c['host']}-{j}.json"
                    + "".join(f" --backend-param {kv}" for kv in args.backend_param)
                    + (f" --adapter-json '{args.adapter_json}'" if args.adapter_json else "")
                    + (" --keep-prepop" if args.keep_prepop else "")
@@ -243,7 +245,7 @@ def replay_one(plan_path: Path, out: Path, args) -> None:
     loaded = sum(r["loaded"] for r in recs)
     res = {
         "plan": str(plan_path), "out": str(out), "trace": plan["trace"], "speed": plan["speed"], "hosts": hosts,
-        "stripe": args.stripe or cal["layout"]["default_stripe"], "slots": args.slots, "procs": args.procs, "max_batch": args.max_batch,
+        "stripe": args.stripe or cal["layout"]["default_stripe"], "slots": args.slots, "procs": args.procs, "max_batch": args.max_batch, "prefill_tps": args.prefill_tps,
         "backend_param": args.backend_param, "adapter_json": args.adapter_json, "load_rdonly": args.load_rdonly,
         "data_dir": data_dir, "keep_prepop": args.keep_prepop,
         "storage_restart": {n: [p, pids1.get(n)] for n, p in pids0.items() if pids1.get(n) != p} or None,

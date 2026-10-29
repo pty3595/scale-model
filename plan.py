@@ -13,6 +13,7 @@
 event 하나 = request 하나: [replay 시각(초), lookup 할 key 들, load 할 key 들, store 묶음들]
   lookup: L1 prefix 뒤의 chunk 전부 (실제 LMCache 처럼 없는 key 도 묻는다 — adapter 가 3FS 에 stat 한다).
           서빙 설정의 lmcache.rules 가 8d7d2c4 면 chunk 전부(그 판의 LMCache 처럼)
+          ad1d738 이면 GPU(vLLM APC)가 가진 앞부분 뒤의 chunk 전부(60538a0 부터의 LMCache 처럼)
   store 묶음: prefill 단계마다 하나 (8192 token 단계면 최대 32 chunk)
 구간 안에서 3FS lookup 이 찾아야 하는데 구간 전에 저장됐어야 할 chunk 는 prepopulate 로 따로 낸다 (replay 전에 써 둔다).
 
@@ -56,7 +57,7 @@ def simulate(trace: str, start_min: float, minutes: float, clients: int, cfg: di
     assigned = [0] * clients
     prepop = [set() for _ in range(clients)]
     stored_in_window = set()
-    counts = {"L1": 0, "L2": 0, "store": 0, "dup": 0, "lost": 0}
+    counts = {"L1": 0, "L2": 0, "store": 0, "dup": 0, "lost": 0, "gpu": 0}
     n_req = n_chunks = n_lookup = n_hit = 0
     for r in reqs:
         t = r["timestamp"] / tdiv - t0
@@ -76,6 +77,7 @@ def simulate(trace: str, start_min: float, minutes: float, clients: int, cfg: di
             return n
         cl = max(range(clients), key=lambda c: (cached_prefix(c), -assigned[c]))
         assigned[cl] += len(ck)
+        l1_used = len(sims[cl].l1) / sims[cl].l1_cap          # 도착 때 L1 사용률 (prefetch 들이기 판정용)
         res = sims[cl].request(toks, 1, ck)
         labels = res["labels"]
         if t < w0:
@@ -84,28 +86,33 @@ def simulate(trace: str, start_min: float, minutes: float, clients: int, cfg: di
         n_chunks += len(ck)
         for x in labels:
             counts[x] += 1
-        p1, p2 = res["p1"], res["p2"]
+        s0, p1, p2 = res["s0"], res["p1"], res["p2"]
         lf = res["lookup_from"]                       # L2 lookup 이 묻는 첫 청크 (LMCache 판에 따라 p1 또는 0)
         n_lookup += len(ck) - lf
         n_hit += p2
         loads = [c for c, x in zip(ck, labels) if x == "L2"]
         stores = {c for c, x in zip(ck, labels) if x == "store"}
         batches = [[key(c) for c in b if c in stores] for b in res["store_batches"]]
-        for c in ck[p1:p1 + p2]:                      # lookup 이 찾는 chunk (L1 에 남아 있어 읽지 않는 것도)
+        after = [a for b, a in zip(batches, res["store_after_tokens"]) if b]
+        for c in ck[s0 + p1:s0 + p1 + p2]:            # lookup 이 찾는 chunk (L1 에 남아 있어 읽지 않는 것도)
             if c not in stored_in_window:
                 prepop[cl].add(key(c))
         stored_in_window.update(stores)
         if lf < len(ck) or stores:
-            # 마지막 값은 대화 번호 — replay 가 한 클라이언트의 event 를 프로세스 여럿에 나눌 때 같은 대화를 한 프로세스에 둔다
+            # 4 번째는 대화 번호 — replay 가 한 클라이언트의 event 를 프로세스 여럿에 나눌 때 같은 대화를 한 프로세스에 둔다
+            # 5 번째는 도착 때 L1 사용률, 6 번째는 store 묶음마다 그때까지 새로 계산한 토큰
             events[cl].append([t - w0, [key(c) for c in ck[lf:]], [key(c) for c in loads], [b for b in batches if b],
-                               grp.setdefault(ck[0], len(grp))])
+                               grp.setdefault(ck[0], len(grp)), round(l1_used, 4), after])
 
     seen = set()
     for p in prepop:                                  # 같은 chunk 를 두 클라이언트가 미리 쓰지 않게
         p -= seen
         seen |= p
     return {
-        "trace": name, "window_min": [start_min, start_min + minutes], "clients": clients,
+        "trace": name, "window_min": [start_min, start_min + minutes], "clients": clients, "rules": cfg["lmcache"].get("rules", "a44d5e5"),
+        # LMCache 의 L2 prefetch 들이기: 8d7d2c4 까지는 동시 8개(replay --slots), a6accee6(10-21)부터는 L1 바이트 기준(replay 가 따라 한다)
+        "admission": "watermark" if cfg["lmcache"].get("rules") == "ad1d738" else "slots",
+        "l1_bytes": cfg["lmcache"]["l1_size_gb"] * 2**30, "prefetch_watermark": cfg["lmcache"].get("l2_prefetch_inflight_watermark", 0.5),
         "serving_cfg": cfg.get("name"), "chunk_bytes": chunk_bytes, "chunk_tokens": cfg["lmcache"]["chunk_size"],
         "requests": n_req, "chunks": n_chunks, "labels": counts,
         "load_chunks": counts["L2"], "store_chunks": counts["store"],
@@ -224,7 +231,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     lb = base["labels"]
     print(f"{base['trace']} {base['window_min'][0]:g}~{base['window_min'][1]:g}분  request {base['requests']}  "
-          f"chunk {base['chunks']} — L1 {lb['L1']} · 3FS load {lb['L2']} · store {lb['store']} · 3FS IO 없음 {lb['lost'] + lb['dup']}  "
+          f"chunk {base['chunks']} — L1 {lb['L1']} · 3FS load {lb['L2']} · store {lb['store']} · 3FS IO 없음 {lb['lost'] + lb['dup'] + lb.get('gpu', 0)}  "
           f"3FS lookup {base['lookup_chunks']} (없는 key {base['lookup_misses']})  미리 쓸 chunk {base['prepopulate_chunks']}  "
           f"store÷load {base['store_chunks'] / max(1, base['load_chunks']):.2f}")   # 1 을 넘으면 store 벽에 먼저 걸리기 쉽다(10-24 coder 60분 1.26)
     index = []

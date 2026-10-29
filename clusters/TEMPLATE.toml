@@ -22,6 +22,10 @@ admin_host = ""               # admin_cli 를 돌릴 노드(ssh_user 로 접속�
 fuse_log = ""                 # FUSE 가 설정을 찍는 로그 — 설정이 실제로 걸렸는지 여기서 본다
 fuse_service = ""             # FUSE systemd 서비스(fuse_restart 를 허락할 때만 쓴다)
 fuse_template = ""            # 지금 mgmtd 의 FUSE 템플릿 사본(discover 가 받아 둔다). 실험이 끝나면 이것으로 되돌린다
+# (선택) raw_hf3fs 만 — FUSE 없이 붙을 곳. FUSE launcher 설정(hf3fs_fuse_main_launcher.toml)의 값
+# mgmtd = "RDMA://<ip>:8000"   # mgmtd_server_addresses
+# cluster_id = ""             # cluster_id
+# ib_devices = ""             # [ib_devices] device_filter (쉼표로)
 
 # 바꿔도 되는 것. 클러스터 주인에게 묻고 채운다. false 면 그 설정 후보는 건너뛰고 지금 값만 기록한다
 [allow]
@@ -82,7 +86,7 @@ chunk_bytes = ""
 # [prepop_gibps]
 # hf3fs = 1.5
 
-# (선택) 빌드 경로. NIXL dram_zc 의 2 GiB 버그 shim(LD_PRELOAD) — 그 knob 을 쓸 때만, 클라이언트마다 같은 경로
+# (선택) 빌드 경로. NIXL dram_zc 의 2 GiB 버그 shim(LD_PRELOAD, 소스 tune/pwrite_full.c) — 그 knob 을 쓸 때만, 클라이언트마다 같은 경로
 # fio-usrbio · 엔진 · libhf3fs_api(ceiling.py) — 클라이언트마다 같은 경로. 아래는 기본값
 # [builds]
 # pwrite_shim = "/tmp/pwrite_full.so"
@@ -93,3 +97,6 @@ chunk_bytes = ""
 # [builds.hf3fs]                  # nixl_store_dynamic · nixl_native · hf3fs
 # python = "$HOME/venv-lmcache-hf3fs/bin/python"
 # pythonpath = "$HOME/LMCache-hf3fs"      # (선택) 그 python 위에 PYTHONPATH 로 얹을 LMCache 소스
+# [builds.raw_hf3fs]              # PR 5828 — 3FS 소스 빌드가 있어야 한다(HANDOFF)
+# python = "$HOME/venv-lmcache-hf3fs/bin/python"
+# pythonpath = "$HOME/LMCache-raw"

@@ -92,7 +92,10 @@ def versions():
     for l in C.admin("list-clients").splitlines()[1:]:
         f = l.split()
         if len(f) > 8:
-            (v.__setitem__(f[8], int(f[7])) if f[8] in C.CLIENT_SET else others.append(f[8]))
+            if f[8] in C.CLIENT_SET:
+                v[f[8]] = int(f[7])
+            elif not (f[8] == "N/A" and f[0].rsplit("_", 2)[0] in C.CLIENT_SET):
+                others.append(f[8])     # 우리 raw_hf3fs connector(ClientId 호스트_pid_n, 호스트 N/A)는 FUSE 가 아니라 템플릿을 받지 않는다
     if others:
         raise SystemExit(f"우리 목록 밖의 FUSE 클라이언트가 있다({', '.join(sorted(set(others)))}) — FUSE 템플릿을 바꾸면 그쪽에도 걸린다")
     return v
