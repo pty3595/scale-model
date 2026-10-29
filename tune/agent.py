@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """AI 에이전트의 입구 — RUNBOOK.md 의 점검 · 측정 계획 · 지켜보기 · 멈추기 · 결과 보고를 명령 하나씩으로 한다.
 명령 모양이 늘 같아 권한 허락을 `python3 tune/agent.py` 한 줄로 줄 수 있고, 측정은 점검을 건너뛰지 못한다.
-무엇을 어떤 순서로 잴지는 PLAN 이 정한다 — 앞 단계 결과로 다음 단계의 knob · 클러스터 설정을 고른다.
+무엇을 어떤 순서로 잴지는 계획이 정한다 — 사용자가 정한 trace x 모델 하나에서, 앞 단계 결과로 다음 단계의 knob · 클러스터 설정을 고른다.
 
   agent.py install      클라이언트마다 adapter 셋 · NIXL HF3FS plugin · pwrite shim 이 있고 빌드가 같은지. 실패면 종료 코드 1
   agent.py check        측정 전 점검. 하나라도 실패면 종료 코드 1
-  agent.py plan         측정 계획의 단계마다 끝났나 · 남았나 · 남은 시간 어림
+  agent.py plan [--trace T --model M]
+                        측정 계획의 단계마다 끝났나 · 남았나 · 남은 시간 어림. 상황(trace x 모델)을 주면 저장하고 next · report 가 그것을 쓴다
   agent.py next         점검을 통과하면 계획에서 아직 안 끝난 첫 단계를 띄운다(터미널이 끊겨도 돈다)
   agent.py status       돌고 있는 측정, 끝난 실행 줄(버림 포함), 끝났는지
   agent.py stop         agent.py 가 띄운 측정만 멈추고 HOME 으로 돌아왔는지 본다
   agent.py report       결과 보고 표를 낸다(results/tune-<규칙>/report-<시각>.md 에도 쓴다)
   agent.py coverage [--trace T] [--model M]   그 trace x 모델에서 knob · 클러스터 설정마다 잰 것 · 안 잰 것
-  agent.py start ADAPTER --knobs a,b --trace T --model M (--settings x,y | --start S --repeat N --rep-start K)
+  agent.py start ADAPTER --knobs a,b --trace T --model M (--settings x,y | --start S --repeat N --rep-start K | --start S --screen)
                         사용자가 계획 밖의 것을 콕 집어 시켰을 때만. 인자는 tune.py sweep 그대로
 """
 import json
@@ -38,15 +39,22 @@ RUN_LINE = re.compile(r" x[0-9.]+ +load ")
 NOT_RUN = {"raw_hf3fs": "RUNBOOK: raw_hf3fs 는 돌리지 않는다(3FS 소스 빌드가 필요하고, 그 PR 의 test 는 클러스터의 모든 chunk 를 지운다)"}
 AD = ["hf3fs", "nixl_store_dynamic", "nixl_native"]   # 잴 adapter 와 순서 — hf3fs 가 기준
 
-# --- 측정 계획 (Spark 에서 정했다, 10-28) ---
-# 1 기준 상황(coder x Qwen3-14B, 클러스터 base)에서 adapter 셋의 knob 전부 — adapter 끼리 견주는 것이 이 도구의 목적이라 셋 다 잰다
-# 2 adapter 마다 가장 좋은 knob 에서 클러스터 설정(허락된 것) — tune.py 의 기본 후보
-# 3 adapter 마다 가장 좋은 조합의 최대 배속과 그 위 한 칸을 두 번씩 더(세 번 중 두 번으로 경계를 정한다)
-# 4 다른 trace · 모델에서 adapter 마다 1 의 가장 좋은 knob(클러스터 base). Spark 에서 모델마다 가장 좋은 knob 이 달랐다 — 시간 때문에 하나만
-BASE_WL = ("coder", "qwen3-14b")
+# --- 측정 계획 — 사용자가 정한 상황(trace x 모델) 하나에서 adapter · knob · 클러스터 설정을 고른다 ---
+# trace · 모델은 사용자의 요구(주어진 것)이고, adapter · knob · 클러스터 설정은 서빙 인프라가 고르는 것이다.
+# 1 기준 knob: adapter 마다 REF 를 search → 그 최대 배속 L
+# 2 knob 거르기: 나머지 knob 을 L 위 한 칸에서 한 번씩 돌려 여유(margin)로 줄 세운다. 셋 이상 통과하면 통과한 것만 두 배 위에서 다시
+# 3 knob search: 마지막 거르기의 위 둘(REF 포함)만 search → adapter 마다 가장 좋은 knob
+# 4 클러스터 설정: 가장 빠른 adapter · knob 에서만. 허락된 설정을 그 최대 위 한 칸에서 거르고, base 보다 여유가 큰 위 하나를 search
+# 5 경계 확인: 가장 좋은 조합의 최대 배속과 그 위 한 칸을 두 번씩 더(세 번 중 두 번으로 경계를 정한다)
+# 거르기 검증(10-29, Spark 의 옛 search 결과 7 상황 · 30 경우): 한 번 잰 여유의 1등이 search 1등과 같다 26, 위 둘 안에 든다 28.
+#   틀린 것은 최대 배속 한 칸(13-20%) 차이다 — 같은 설정을 같은 배속에서 다시 재도 store 비율이 0.84-0.96 으로 흔들리는 폭이다.
+#   모두 통과하는 낮은 배속에서는 여유가 store 비율 상한(1/0.95)에 붙어 줄을 못 세운다 → 기준의 최대 위에서 거른다
+REF = {"hf3fs": "s16-d16", "nixl_store_dynamic": "dram_zc", "nixl_native": "w4"}   # 거르기 배속을 정할 출발점(Spark 에서 가장 좋았던 것). 후보는 knob 전부
 SETS = ["b1m", "r32-1m", "r6", "rts", "c512k"]          # 클러스터 설정 후보 — FUSE 재시작이 필요한 쓰기 설정(w32 · src-w32)은 뺀다
-OTHER = [("coder", "ds-v3"), ("coder", "llama-70b"), ("apib", "qwen3-14b"), ("chata", "qwen3-14b"), ("coder60", "qwen3-14b")]
+DEFAULT = ("coder", "qwen3-14b")
+SITUATION = T.OUT / "agent-situation"                     # 사용자가 정한 trace · 모델 — plan --trace --model 로 정하면 next · report 가 쓴다
 SEARCH_H = (0.25, 0.75)                                   # search 하나의 시간(어림, Spark: 최대 x1 위면 15-25분, x0.5 아래면 1시간 가까이)
+RUN_H = (0.05, 0.25)                                      # 거르기 · 경계 확인 실행 하나(어림, Spark: x1 위면 3-5분, x0.25 면 15분)
 
 def folder(adapter, trace, model):
     """tune.py Sweep 의 결과 폴더(같은 규칙)"""
@@ -103,58 +111,154 @@ def best_tag(res, tags):
     return max(done)[2] if done else None
 
 
+def margin(m):
+    """판정 기준(tune/analyze.py LATE_MAX · STORE_MIN · MISS_MAX) 대비 여유 — 1 을 넘으면 통과. 무효면 None"""
+    if not m.get("valid", True):
+        return None
+    return min(T.A.LATE_MAX / max(m.get("late_p99") or 0, 1e-3),
+               (1 if m.get("store_ratio") is None else m["store_ratio"]) / T.A.STORE_MIN,
+               T.A.MISS_MAX / max(m.get("missed_frac") or 0, 1e-4))
+
+
+def n_runs(a, tr, mo):
+    """그 adapter · 상황에서 지금까지 끝난 실행 수"""
+    return sum(len(sp) for sp in results(a, tr, mo).values())
+
+
+def at(res, tag, sp):
+    """그 tag(.rN 빼고)를 그 배속에서 잰 실행, 없으면 None"""
+    ms = speeds(res, tag, False).get(sp)
+    return ms[0] if ms else None
+
+
+def situation(args=()):
+    """사용자가 정한 (trace, 모델). --trace · --model 을 함께 받으면 저장하고, 아니면 저장된 것(없으면 DEFAULT)"""
+    tr, mo = opt(list(args), "--trace"), opt(list(args), "--model")
+    if tr or mo:
+        bad = ([] if tr in T.WORKLOADS else [f"trace {tr}"]) + ([] if mo in T.MODELS else [f"모델 {mo}"])
+        if bad:
+            raise SystemExit(f"없는 이름: {', '.join(bad)} — trace: {', '.join(T.WORKLOADS)} / 모델: {', '.join(T.MODELS)}")
+        SITUATION.parent.mkdir(parents=True, exist_ok=True)
+        SITUATION.write_text(f"{tr} {mo}")
+        return tr, mo
+    return tuple(SITUATION.read_text().split()) if SITUATION.exists() else DEFAULT
+
+
+def finalists(res, a, L):
+    """2 knob 거르기 → (거르기 단계 [(배속, 후보, 다 쟀나)], search 할 위 둘 | None(거르기가 덜 끝남)).
+    셋 이상 통과하면 통과한 것끼리 두 배 위에서 다시 — 통과한 것끼리는 여유가 상한에 붙어 못 가르고, 높은 배속일수록 실행이 짧다"""
+    ref = REF[a]
+    cands = [k for k in T.ADAPTERS[a]["knobs"] if k != ref]
+    sp = up_of(L) if L else T.GRID[0]
+    levels = []
+    while cands and sp:
+        got = {k: at(res, f"{k}+base", sp) for k in cands}
+        levels.append((sp, cands, all(m is not None for m in got.values())))
+        if not levels[-1][2]:
+            return levels, None
+        passed = [k for k, m in got.items() if ok(m)]
+        if len(passed) < 3:
+            break
+        i = T.GRID.index(sp)
+        cands, sp = passed, (T.GRID[i + T.JUMP] if i + T.JUMP < len(T.GRID) else None)
+    score = {k: margin(m) for k, m in got.items() if margin(m) is not None} if cands else {}
+    if not levels or len(levels) == 1:                   # 첫 칸이면 REF 도 같은 배속에서 쟀다(search 가 L 위 한 칸을 잰다)
+        rm = at(res, f"{ref}+base", sp if cands else (up_of(L) if L else T.GRID[0]))
+        if rm and margin(rm) is not None:
+            score[ref] = margin(rm)
+    return levels, sorted(score, key=lambda k: -score[k])[:2]
+
+
 def steps():
-    """계획의 단계: (이름, adapter, trace, model, tune.py 인자 | None(앞 단계를 기다림), 끝났나, 설명, 남은 search 수)"""
-    out = []
-    tr, mo = BASE_WL
-    bk = {}
-    for a in AD:
+    """계획의 단계: (이름, adapter, trace, model, tune.py 인자 | None(앞 단계를 기다림), 끝났나, 설명, 남은 search 수, 남은 실행 수)"""
+    tr, mo = situation()
+    out, bk, lk = [], {}, {}
+    w = lambda *x: [x[0], "--knobs", x[1], "--trace", tr, "--model", mo, "--settings", x[2]] + list(x[3:])
+    for a in AD:                                         # 1 기준 knob
+        res, ref = results(a, tr, mo), REF[a]
+        done = search_done(res, f"{ref}+base")
+        out.append(("1 기준 knob", a, tr, mo, w(a, ref, "base"), done, f"knob {ref}", 0 if done else 1, 0))
+        lk[a] = best_speed(res, f"{ref}+base") if done else "wait"
+    for a in AD:                                         # 2 knob 거르기
         res = results(a, tr, mo)
-        ks = list(T.ADAPTERS[a]["knobs"])
-        left = [k for k in ks if not search_done(res, f"{k}+base")]
-        out.append(("1 knob 전부", a, tr, mo, [a, "--knobs", ",".join(ks), "--trace", tr, "--model", mo, "--settings", "base"],
-                    not left, f"knob {len(ks) - len(left)}/{len(ks)}", len(left)))
-        bk[a] = None if left else best_tag(res, [f"{k}+base" for k in ks]).split("+")[0]
+        if lk[a] == "wait":
+            out.append(("2 knob 거르기", a, tr, mo, None, False, "1 단계를 기다린다", 0, len(T.ADAPTERS[a]["knobs"]) - 1))
+            out.append(("3 knob search", a, tr, mo, None, False, "2 단계를 기다린다", 1, 0))   # 시간 어림: 보통 REF 가 위 둘에 들어 하나
+            bk[a] = "wait"
+            continue
+        levels, top = finalists(res, a, lk[a])
+        for sp, cands, full in levels:
+            left = [k for k in cands if at(res, f"{k}+base", sp) is None]
+            out.append(("2 knob 거르기", a, tr, mo, w(a, ",".join(left or cands), "base", "--start", f"{sp:g}", "--screen"), full,
+                        f"x{sp:g} 에서 {len(cands) - len(left)}/{len(cands)}", 0, len(left)))
+        if top is None:
+            out.append(("3 knob search", a, tr, mo, None, False, "2 단계를 기다린다", 1, 0))
+            bk[a] = "wait"
+            continue
+        searched = [REF[a]]
+        for k in top:                                    # 3 knob search — 거르기에서 통과한 가장 높은 배속(없으면 L)에서 출발
+            if k == REF[a]:
+                continue
+            passed = [sp for sp, ms in speeds(res, f"{k}+base", False).items() if any(ok(m) for m in ms)]
+            st = max(passed) if passed else (lk[a] or T.GRID[0])
+            done = search_done(res, f"{k}+base")
+            out.append(("3 knob search", a, tr, mo, w(a, k, "base", "--start", f"{st:g}"), done, f"knob {k} (거르기 위 둘: {', '.join(top)})",
+                        0 if done else 1, 0))
+            searched.append(k)
+        bk[a] = (best_tag(res, [f"{k}+base" for k in searched]) if all(search_done(res, f"{k}+base") for k in searched) else "wait")
     sets = [x for x in SETS if allowed_setting(x)]
-    skip = [x for x in SETS if x not in sets]
-    for a in AD if sets else []:
-        res, k = results(a, tr, mo), bk[a]
-        left = [x for x in sets if not (k and search_done(res, f"{k}+{x}"))]
-        note = (f"knob {k}, 설정 {len(sets) - len(left)}/{len(sets)}" if k else "1 단계를 기다린다") + (f", 허락 없어 뺌: {','.join(skip)}" if skip else "")
-        out.append(("2 클러스터 설정", a, tr, mo,
-                    [a, "--knobs", k, "--trace", tr, "--model", mo, "--settings", ",".join(["base"] + sets)] if k else None,
-                    bool(k) and not left, note, len(left)))
-    for a in AD:
-        res, k = results(a, tr, mo), bk[a]
-        ready = k and all(search_done(res, f"{k}+{x}") for x in sets)
-        combo = best_tag(res, [f"{k}+base"] + [f"{k}+{x}" for x in sets]) if ready else None
-        b = best_speed(res, combo) if combo else None
-        for which, sp in (("최대", b), ("위 한 칸", up_of(b) if b else None)):
-            n = [m for m in speeds(res, combo).get(sp, [])] if sp else []
-            done = bool(combo) and (b is None or len(n) >= 3)
-            args = ([a, "--knobs", k, "--trace", tr, "--model", mo, "--settings", combo.split("+")[1],
-                     "--start", f"{sp:g}", "--repeat", "2", "--rep-start", "2"] if combo and sp else None)
-            out.append((f"3 경계 확인({which})", a, tr, mo, args, done,
-                        (f"{combo} x{sp:g} {len(n)}번 잼" if sp else ("통과한 배속 없음 — 건너뜀" if combo else "앞 단계를 기다린다")),
-                        0 if done else 0.3))
-    for tr2, mo2 in OTHER:
-        for a in AD:
-            k = bk[a]
-            done = bool(k) and search_done(results(a, tr2, mo2), f"{k}+base")
-            out.append(("4 다른 trace · 모델", a, tr2, mo2,
-                        [a, "--knobs", k, "--trace", tr2, "--model", mo2, "--settings", "base"] if k else None,
-                        done, f"knob {k}" if k else "1 단계를 기다린다", 0 if done else 1))
+    if any(v == "wait" for v in bk.values()):            # 4 · 5 는 adapter 셋이 다 끝난 뒤
+        out.append(("4 클러스터 설정", "-", tr, mo, None, False, "3 단계를 기다린다", 1 if sets else 0, len(sets)))
+        out.append(("5 경계 확인", "-", tr, mo, None, False, "4 단계를 기다린다", 0, 4))
+        return out
+    ranked = sorted((a for a in AD if bk[a] and best_speed(results(a, tr, mo), bk[a])), key=lambda a: -best_speed(results(a, tr, mo), bk[a]))
+    if not ranked:
+        out.append(("4 클러스터 설정", "-", tr, mo, None, True, "통과한 adapter 가 없다 — 건너뜀", 0, 0))
+        return out
+    wa = ranked[0]
+    res, tag = results(wa, tr, mo), bk[wa]
+    k, b = tag.split("+")[0], best_speed(res, tag)
+    combo = tag
+    if sets:
+        sp = up_of(b)
+        got = {x: at(res, f"{k}+{x}", sp) for x in sets}
+        left = [x for x, m in got.items() if m is None]
+        out.append(("4 설정 거르기", wa, tr, mo, w(wa, k, ",".join(left or sets), "--start", f"{sp:g}", "--screen"), not left,
+                    f"{k}, x{sp:g} 에서 {len(sets) - len(left)}/{len(sets)}", 0, len(left)))
+        if left:
+            out.append(("5 경계 확인", wa, tr, mo, None, False, "4 단계를 기다린다", 0, 4))
+            return out
+        base_m = at(res, tag, sp)
+        sc = {x: margin(m) for x, m in got.items() if margin(m) is not None}
+        top = max(sc, key=sc.get) if sc else None
+        if top and (base_m is None or margin(base_m) is None or sc[top] > margin(base_m)):
+            done = search_done(res, f"{k}+{top}")
+            passed = [x for x, ms in speeds(res, f"{k}+{top}", False).items() if any(ok(m) for m in ms)]
+            out.append(("4 설정 search", wa, tr, mo, w(wa, k, top, "--start", f"{max(passed) if passed else b:g}"), done, f"{k}+{top}", 0 if done else 1, 0))
+            if not done:
+                out.append(("5 경계 확인", wa, tr, mo, None, False, "4 단계를 기다린다", 0, 4))
+                return out
+            combo = best_tag(res, [tag, f"{k}+{top}"])
+    b = best_speed(res, combo)
+    for which, sp in (("최대", b), ("위 한 칸", up_of(b) if b else None)):   # 5 경계 확인
+        n = speeds(res, combo).get(sp, []) if sp else []
+        done = b is None or len(n) >= 3
+        args = w(wa, k, combo.split("+")[1], "--start", f"{sp:g}", "--repeat", "2", "--rep-start", "2") if sp else None
+        out.append((f"5 경계 확인({which})", wa, tr, mo, args, done, f"{combo} x{sp:g} {len(n)}번 잼" if sp else "통과한 배속 없음 — 건너뜀",
+                    0, 0 if done else 2))
     return out
 
 
 def plan():
     st = steps()
     left = [x for x in st if not x[5]]
-    for name, a, tr, mo, args, done, note, _ in st:
-        print(f"[{'끝' if done else '남음' if args else '기다림'}] {name:16} {a:19} {tr:8} {mo:10} {note}")
-    n = sum(x[7] for x in left)
+    tr, mo = situation()
+    print(f"상황: {tr} x {mo}  (사용자가 정한다 — 바꾸려면 agent.py plan --trace T --model M)")
+    for name, a, tr, mo, args, done, note, *_ in st:
+        print(f"[{'끝' if done else '남음' if args else '기다림'}] {name:16} {a:19} {note}")
+    ns, nr = sum(x[7] for x in left), sum(x[8] for x in left)
     print(f"→ 남은 단계 {len(left)}/{len(st)}" + (" — 계획이 다 끝났다. agent.py report 로 보고한다" if not left else
-          f", 남은 search 약 {n:.0f}개 — 약 {n * SEARCH_H[0]:.0f}-{n * SEARCH_H[1]:.0f}시간(어림)"))
+          f", 남은 search 약 {ns}개 · 한 번 실행 약 {nr}개 — 약 {ns * SEARCH_H[0] + nr * RUN_H[0]:.0f}-{ns * SEARCH_H[1] + nr * RUN_H[1]:.0f}시간(어림)"))
     return left
 
 
@@ -295,17 +399,21 @@ def launch(args, what):
     with open(log, "w") as lf:
         p = subprocess.Popen([sys.executable, "tune/tune.py", "sweep", *args], cwd=SM, stdout=lf, stderr=subprocess.STDOUT,
                              stdin=subprocess.DEVNULL, start_new_session=True)
-    STATE.write_text(json.dumps({"pid": p.pid, "log": str(log), "args": args, "what": what, "started": time.strftime("%m-%d %H:%M")},
+    STATE.write_text(json.dumps({"pid": p.pid, "log": str(log), "args": args, "what": what, "started": time.strftime("%m-%d %H:%M"),
+                                 "runs": n_runs(a, tr, mo)},
                                 ensure_ascii=False))
     print(f"띄웠다: {what}\n  pid {p.pid}, 로그 {log.relative_to(SM)}\n  tune.py sweep {' '.join(args)}")
     print("10-20분마다 `python3 tune/agent.py status` 로 본다. 끝나면(→ 끝났다) `agent.py next` 로 다음 단계를 띄운다")
 
 
 def next_step():
-    for name, a, tr, mo, args, done, note, _ in steps():
+    last = json.loads(STATE.read_text()) if STATE.exists() else {}
+    for name, a, tr, mo, args, done, note, *_ in steps():
         if not done:
             if args is None:
                 raise SystemExit(f"{name} {a} 는 앞 단계를 기다린다 — agent.py plan 출력을 사용자에게 보고한다")
+            if last.get("args") == args and not alive(last["pid"]) and last.get("runs") == n_runs(a, tr, mo):   # 같은 단계를 띄웠는데 실행이 늘지 않았다
+                raise SystemExit(f"{name} {a} 를 다시 띄워도 진행이 없다(앞 실행 로그 {last['log']}) — agent.py plan · status 출력을 사용자에게 보고하고 기다린다")
             return launch(args, f"{name} · {a} · {tr} x {mo} · {note}")
     print("계획이 다 끝났다 — `python3 tune/agent.py report` 로 보고한다")
 
@@ -413,11 +521,11 @@ def coverage(trace, model):
         print(f"-- {a}   ({(folder(a, trace, model) / 'result.json').relative_to(SM)}{'' if res else ', 아직 없음'})")
         for k in T.ADAPTERS[a]["knobs"]:
             c = cell(res, f"{k}+base")
-            total, done = total + 1, done + search_done(res, f"{k}+base")
+            total, done = total + 1, done + bool(speeds(res, f"{k}+base"))
             print(f"   {k + '+base':26} {c or '-  안 잼'}")
         for t in sorted({t.split(".r")[0] for t in res if not t.split(".r")[0].endswith("+base")}):
             print(f"   {t:26} {cell(res, t)}")
-    print(f"→ base 에서 search 가 끝난 knob {done}/{total}" + (" — 다 쟀다" if done == total else " — 안 잰 것이 있다. '다 했다'고 하지 않는다"))
+    print(f"→ base 에서 잰 knob(거르기 · search) {done}/{total}" + (" — 다 쟀다" if done == total else " — 안 잰 것이 있다. '다 했다'고 하지 않는다"))
 
 
 def report():
@@ -432,7 +540,7 @@ def report():
     out = [f"## {time.strftime('%Y-%m-%d')} {C.NAME} 측정 결과", "",
            f"계획 단계 {len(st) - len(left)}/{len(st)} 끝" + (" — 계획이 다 끝났다" if not left else f" — 남은 단계 {len(left)}개(agent.py plan). 다 끝났다고 쓰지 않는다"),
            f"클러스터 설정 허락: FUSE 템플릿 {C.allowed('fuse_template')} · storage hot-update {C.allowed('storage_hot_update')}", ceil, ""]
-    for tr, mo in [BASE_WL] + OTHER:
+    for tr, mo in [situation()]:
         rows = []
         for a in AD:
             res = results(a, tr, mo)
@@ -452,9 +560,9 @@ def report():
             drops = T.A.metrics(run).get("storage_rx_discards") if (run / "summary.json").exists() else None
             rows.append(f"| {a} | {t} | {cell(res, t)} | {f3(m.get('load'))} · {f3(m.get('store'))} | "
                         f"{f3(m.get('of_3fs_load'))} · {f3(m.get('of_3fs_store'))} | {'-' if drops is None else f'{drops:,}'} | "
-                        f"{sum(1 for k in T.ADAPTERS[a]['knobs'] if search_done(res, f'{k}+base'))}/{len(T.ADAPTERS[a]['knobs'])} |")
+                        f"{sum(1 for k in T.ADAPTERS[a]['knobs'] if speeds(res, f'{k}+base'))}/{len(T.ADAPTERS[a]['knobs'])} |")
         out += [f"### {tr} x {mo}", "",
-                "| adapter | 가장 좋은 knob+설정 | 최대 배속 통과/횟수 · 위 한 칸 통과/횟수 막힌 쪽 | 최대에서 load · store GiB/s | 3FS 천장 대비 load · store | storage 수신 버림 | base 에서 잰 knob |",
+                "| adapter | 가장 좋은 knob+설정 | 최대 배속 통과/횟수 · 위 한 칸 통과/횟수 막힌 쪽 | 최대에서 load · store GiB/s | 3FS 천장 대비 load · store | storage 수신 버림 | 잰 knob(거르기 포함) |",
                 "|---|---|---|---|---|---|---|"] + rows + [""]
     out += ["- 추정: (에이전트가 채운다. 없으면 \"없음\")", "- 무효 · 멈춘 실행: (에이전트가 채운다. 없으면 \"없음\")",
             "- 클러스터: " + ("; ".join(S.check_home()) or "HOME 과 같다") if not sweeps() else "- 클러스터: 측정이 도는 중"]
@@ -472,6 +580,7 @@ def main():
     elif cmd == "check":
         sys.exit(0 if check() else 1)
     elif cmd == "plan":
+        situation(a[1:])
         plan()
     elif cmd == "next":
         next_step()
@@ -484,7 +593,7 @@ def main():
     elif cmd == "report":
         report()
     elif cmd == "coverage":
-        coverage(opt(a, "--trace") or BASE_WL[0], opt(a, "--model") or BASE_WL[1])
+        coverage(opt(a, "--trace") or situation()[0], opt(a, "--model") or situation()[1])
     else:
         print(__doc__)
 

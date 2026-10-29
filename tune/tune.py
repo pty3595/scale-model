@@ -299,8 +299,8 @@ class Sweep:
         S.log(f"   {tag} 최대 " + (f"x{best:g} (디스크 읽기 {res[best].get('disk_read') or 0:.2f} GiB/s)" if best else f"x{GRID[0]:g} 미만"))
         return best
 
-    def repeat(self, knobs, speed, times, first=2, settings=("base",)):
-        """search 대신 그 배속만 다시 잰다(tag 끝 .r2 · .r3 …) — 한 칸 차이를 세 번 중 두 번으로 정할 때"""
+    def each_setting(self, settings):
+        """클러스터 설정마다 걸고 (이름, 설정)을 낸다 — 걸 수 없는 것은 건너뛴다"""
         for name in settings:
             f = SETTINGS[name]
             if self.v.get("layout") and f.get("chunk"):
@@ -311,10 +311,21 @@ class Sweep:
             except S.NotAllowed as e:
                 S.log(f"   {name}: {e} 을 바꿀 허락이 없어 건너뛴다")
                 continue
+            yield name, f
+
+    def repeat(self, knobs, speed, times, first=2, settings=("base",)):
+        """search 대신 그 배속만 다시 잰다(tag 끝 .r2 · .r3 …) — 한 칸 차이를 세 번 중 두 번으로 정할 때"""
+        for name, f in self.each_setting(settings):
             for k in knobs:
                 d = data_dir(self.adapter, k, f.get("chunk") or self.v.get("layout"), self.wm)
                 oks = [self.measure(f"{k}+{name}.r{i}", self.v["knobs"][k], d, speed)["ok"] for i in range(first, first + times)]
                 S.log(f"   {k}+{name} x{speed:g} 다시 {times}번: 통과 {sum(oks)}")
+
+    def screen(self, knobs, speed, settings=("base",)):
+        """search 대신 그 배속에서 한 번씩 — 후보 거르기. tag 가 search 와 같아 뒤의 search 가 이 실행을 그대로 쓴다"""
+        for name, f in self.each_setting(settings):
+            for k in knobs:
+                self.measure(f"{k}+{name}", self.v["knobs"][k], data_dir(self.adapter, k, f.get("chunk") or self.v.get("layout"), self.wm), speed)
 
     def go(self, knobs, settings, start, set_start=None):
         best_knob, best_sp = None, None
@@ -436,6 +447,7 @@ def main():
     ap.add_argument("--trace", default="coder", choices=list(WORKLOADS), help="trace 구간")
     ap.add_argument("--model", default="qwen3-14b", choices=list(MODELS), help="모델(token 당 KV 크기)")
     ap.add_argument("--repeat", type=int, default=0, help="search 대신 --start 배속만 이 횟수만큼 다시 잰다(실험 기준 REF 에서)")
+    ap.add_argument("--screen", action="store_true", help="search 대신 --start 배속에서 knob x 클러스터 설정마다 한 번씩(후보 거르기)")
     ap.add_argument("--rep-start", type=int, default=2, help="--repeat 의 tag 첫 번호(.rN) — 앞서 쓴 번호와 겹치지 않게")
     ap.add_argument("--set-start", type=float, help="클러스터 설정 search 의 첫 배속(기본: adapter 설정의 최대 배속)")
     ap.add_argument("--evict", help="L1 비우기 문턱/비율(LMCache 기본 0.8/0.2). plan 을 시뮬레이터로 다시 낸다(IO 양이 바뀐다)")
@@ -456,7 +468,9 @@ def main():
     knobs = args.knobs.split(",") if args.knobs else list(sw.v["knobs"])
     try:
         start = on_grid(args.start or START)
-        if args.repeat:
+        if args.screen:
+            sw.screen(knobs, start, args.settings.split(","))
+        elif args.repeat:
             sw.repeat(knobs, start, args.repeat, args.rep_start, args.settings.split(",") if args.settings != ap.get_default("settings") else ("base",))
         else:
             sw.go(knobs, args.settings.split(","), start, args.set_start and on_grid(args.set_start))

@@ -5,11 +5,13 @@
 
 ## 이 일의 목적
 
-실제 서비스 클러스터에서 LMCache 의 3FS L2 adapter 중 무엇을, 어떤 설정으로 써야 KV cache IO 를 가장 잘 따라가는지 알고 싶다.
+사용자가 정한 상황(trace x 모델)에서, LMCache 의 3FS L2 adapter 중 무엇을 어떤 설정으로 써야 KV cache IO 를 가장 잘 따라가는지 알고 싶다.
+trace · 모델은 서빙의 요구라 주어지는 것이고, adapter · knob · 클러스터 설정은 서빙 인프라가 고르는 것이다. 도구는 주어진 상황 하나에서 고를 것만 sweep 한다.
 이 도구는 추론 엔진 없이, 공개 trace 가 만드는 3FS load · store 를 실제 adapter 코드로 재생(replay)한다. 재생 배속을 올려 가며 **따라가는 최대 배속**을 잰다. 같은 하드웨어에서 최대 배속이 높을수록 그 adapter · 설정이 더 큰 부하를 견딘다.
 
+- **상황(trace · 모델)은 사용자가 정한다.** 말하지 않았으면 측정 전에 묻는다. 에이전트가 고르지 않는다
 - **adapter 셋(`hf3fs` · `nixl_store_dynamic` · `nixl_native`)을 같은 조건에서 견주는 것이 이 일의 핵심이다.** 하나만 재면 결과가 아니다. 셋 다 설치하고 셋 다 잰다
-- 낼 결과: trace x 모델마다 adapter 셋의 최대 배속, adapter 마다 가장 좋은 knob · 클러스터 설정, 그 위 배속에서 무엇이 막혔나
+- 낼 결과: 그 상황에서 가장 좋은 adapter · knob · 클러스터 설정과 최대 배속, adapter 마다 가장 좋은 knob, 그 위 배속에서 무엇이 막혔나
 - 무엇을 어떤 순서로 잴지는 `tune/agent.py` 의 계획이 정한다(아래 "측정"). 계획을 줄이거나 바꾸지 않는다
 
 | 말 | 뜻 |
@@ -18,14 +20,15 @@
 | knob | adapter 의 설정 한 벌(worker 수 · 폴더 수 · 메모리 방식). 이름은 `agent.py coverage` 에 다 나온다 |
 | 클러스터 설정 | 3FS FUSE · storage 설정 한 벌(`base` 가 기준). 도구가 걸고 끝나면 되돌린다 |
 | trace · 모델 | 재생할 요청 구간과 KV 크기. 아래 표 |
-| 배속 · search | 배속 = trace 를 몇 배 빠르게 재생하나. search = adapter · knob · 클러스터 설정 · trace · 모델 하나의 최대 배속을 찾는 실행 묶음(1-2시간) |
+| 배속 · search | 배속 = trace 를 몇 배 빠르게 재생하나. search = adapter · knob · 클러스터 설정 하나의 최대 배속을 찾는 실행 묶음(15-45분) |
+| 거르기 | search 대신 한 배속에서 한 번만 돌려, 판정 기준 대비 여유로 후보를 줄 세우는 것. 위 둘만 search 한다 |
 | 통과 | 요청 시작 늦음 p99 1초 미만 + store 를 plan 의 95% 이상 끝냄 + 못 찾은 load 1% 미만 + 무효가 아님 |
 
 ## 하지 않는 것
 
 사용자가 그 일을 콕 집어 시킨 때만 예외다.
 
-1. 계획을 줄이지 않는다 — adapter · knob · 클러스터 설정 · trace · 모델을 빼지 않는다. 설치가 어렵다고 adapter 를 건너뛰지 않는다. 막히면 그 자리에서 멈추고 보고한다
+1. 계획을 줄이지 않는다 — adapter 를 빼거나 단계를 건너뛰지 않는다(거르기에서 떨어진 knob 은 계획이 뺀 것이다). 설치가 어렵다고 adapter 를 건너뛰지 않는다. 막히면 그 자리에서 멈추고 보고한다
 2. 따로 측정 스크립트 · 모니터를 만들지 않는다. 필요한 숫자(망 버림 · 재전송 포함)는 도구가 실행마다 이미 잰다("도구가 재는 것")
 3. 코드(`*.py` · `*.sh`)와 `calibration.json` 을 고치지 않는다. 도구가 에러로 멈추면 고치거나 우회하지 않고 "문제가 생기면"의 표대로 한다
 4. 클러스터 설정을 바꾸는 명령을 직접 치지 않는다 — `admin_cli set-config` · `hot-update-config` · `set-layout`, `systemctl restart`, FUSE 다시 띄우기(`tune/fuse_write.py` 도).
@@ -69,7 +72,8 @@
 | 사용자 요청 | 할 일 |
 |---|---|
 | 처음 설치, adapter 가 안 깔렸다 | "설치" → "클러스터 파일 · 천장" |
-| 측정, sweep, adapter 비교, "다 돌려" | "측정" — 계획을 끝까지 |
+| 측정, sweep, adapter 비교, "다 돌려" | 상황(trace · 모델)을 확인하고 "측정" — 계획을 끝까지 |
+| 이 클러스터에만 있을 knob 을 찾아 달라 | "Spark 에서 못 본 knob" — 후보를 보고만 한다 |
 | 결과를 알려 달라 | "결과 보고" |
 | 지금 망 버림 · 디스크가 어떠냐 | "도구가 재는 것" |
 | 돌던 측정을 멈춰 달라 | `python3 tune/agent.py stop` |
@@ -177,16 +181,27 @@
 
 ### 계획
 
-`python3 tune/agent.py plan` 이 단계마다 끝 · 남음 · 기다림과 남은 시간 어림을 보인다. 단계는 아래 순서이고, 앞 단계 결과로 다음 단계의 knob · 설정을 도구가 고른다.
+처음에 사용자가 정한 상황을 한 번 넣는다: `python3 tune/agent.py plan --trace <trace> --model <모델>`(이름은 "trace · 모델" 표). 그 뒤 `plan` · `next` · `report` 는 그 상황을 쓴다.
+`plan` 이 단계마다 끝 · 남음 · 기다림과 남은 시간 어림을 보인다. 단계는 아래 순서이고, 앞 단계 결과로 다음 단계의 knob · 배속 · 설정을 도구가 고른다.
 
-| 단계 | 무엇 | search 수 |
-|---|---|---|
-| 1 knob 전부 | 기준 상황(coder x Qwen3-14B, 클러스터 `base`)에서 adapter 셋의 knob 전부 | 21 |
-| 2 클러스터 설정 | adapter 마다 1 의 가장 좋은 knob 에서 클러스터 설정 다섯(`[allow]` 가 없는 것은 도구가 뺀다) | 15 이하 |
-| 3 경계 확인 | adapter 마다 가장 좋은 조합의 최대 배속과 그 위 한 칸을 두 번씩 더 | 실행 12 |
-| 4 다른 trace · 모델 | 아래 다섯 상황에서 adapter 마다 1 의 가장 좋은 knob | 15 |
+| 단계 | 무엇 |
+|---|---|
+| 1 기준 knob | adapter 마다 기준 knob 하나를 search 해 최대 배속 L 을 잰다 |
+| 2 knob 거르기 | 나머지 knob 을 L 위 한 칸에서 한 번씩 돌려 줄 세운다. 셋 이상 통과하면 통과한 것만 두 배 위에서 다시 |
+| 3 knob search | adapter 마다 거르기의 위 둘만 search 한다 |
+| 4 클러스터 설정 | 가장 빠른 adapter · knob 에서만 — 설정 다섯을 거르고 base 보다 나은 위 하나를 search(`[allow]` 가 없는 것은 도구가 뺀다) |
+| 5 경계 확인 | 가장 좋은 조합의 최대 배속과 그 위 한 칸을 두 번씩 더 |
 
-search 하나가 15-45분(어림)이라 계획 전체는 13-39시간쯤 걸린다. 사람이 끊지 않는 한 계획이 다 끝날 때까지 이어 간다. 계획을 줄이거나 단계를 건너뛰지 않는다 — 사용자가 adapter · trace · 모델을 콕 집어 시키면 그때만 그것을 `agent.py start` 로 돈다(knob 목록은 `agent.py coverage --trace T --model M`).
+상황 하나에 search 7-10개와 한 번 실행 25-30개, 어림 2-10시간(보통 5시간 안팎)이다. adapter 가 느릴수록 길다 — x0.25 실행 하나가 15분이다. 사람이 끊지 않는 한 계획이 다 끝날 때까지 이어 간다. 계획을 줄이거나 단계를 건너뛰지 않는다 — 사용자가 adapter · knob 을 콕 집어 시키면 그때만 그것을 `agent.py start` 로 돈다(knob 목록은 `agent.py coverage`).
+
+### Spark 에서 못 본 knob
+
+knob 목록은 Spark PoC 클러스터에서 만들었다. 이 클러스터에서만 병목이 되는 설정이 있을 수 있다 — 예: FUSE 데몬의 `[client.thread_pool] num_bg_threads`(USRBIO IO ring 을 처리하는 coroutine 이 모두 이 스레드 풀에 얹힌다).
+사용자가 찾아 달라고 하면 **찾아서 보고만 한다. 바꾸거나 돌리지 않는다**("하지 않는 것" 4).
+
+- 근거로 쓸 것: 측정 중에 꽉 찬 스레드(`top -H -p <hf3fs_fuse_main 의 pid>` 에서 100% 가까운 것), 도구가 잰 값("도구가 재는 것" — CPU · 링크 · 망 손실), 3FS 설정 파일과 3FS 소스
+- 후보마다 보고할 것: 설정 이름(파일과 key), 지금 값, 그것이 병목이라고 보는 근거(숫자와 그 숫자를 읽은 곳), 바꾸려면 무엇이 필요한가(hot-update 로 되나, FUSE · storage 를 다시 띄워야 하나)
+- 짐작은 "추정"이라고 밝힌다. 사용자가 그 후보를 knob 목록에 넣을지 정한다
 
 ### 되풀이
 
@@ -195,7 +210,7 @@ search 하나가 15-45분(어림)이라 계획 전체는 13-39시간쯤 걸린�
 1. `python3 tune/agent.py next` — 점검(다른 사람의 작업 · storage 디스크 · 돌고 있는 측정 · HOME · 3FS 여유)을 하고, 통과하면 남은 첫 단계를 띄운다. 점검이 실패하면 아무것도 띄우지 않는다 → 실패한 줄을 그대로 사용자에게 보고하고 기다린다
 2. 15분마다 `python3 tune/agent.py status` — 끝난 실행 줄이 쌓인다. "→ 돌고 있다"면 계속 기다린다
 3. "→ 끝났다"면 사용자에게 한 줄로 알린다: 끝난 단계 · adapter · 그 status 의 마지막 `최대` 줄
-4. 단계 번호(1 · 2 · 3 · 4)가 하나 다 끝났으면 `python3 tune/agent.py report` 를 사용자에게 보낸다("결과 보고")
+4. 단계 번호(1 · 2 · 3 · 4 · 5)가 하나 다 끝났으면 `python3 tune/agent.py report` 를 사용자에게 보낸다("결과 보고")
 5. 1 로 돌아간다. `plan` 이 "계획이 다 끝났다"면 마지막 `report` 를 보내고 마친다
 
 "→ 끝나지 않고 멈췄다"면 "문제가 생기면"으로 간다.
@@ -204,15 +219,15 @@ search 하나가 15-45분(어림)이라 계획 전체는 13-39시간쯤 걸린�
 
 trace 파일은 `traces/`(Alibaba 공개 trace, Git LFS)에 있다. plan(재생할 load · store 목록)은 도구가 처음 쓸 때 시뮬레이터로 계산해 `plans/tune/` 에 둔다. trace · 모델 목록은 `tune/tune.py` 의 `WORKLOADS` · `MODELS` 이고 고치지 않는다.
 
-| 이름 | 무엇 | 계획에서 |
-|---|---|---|
-| `coder` | Alibaba coder trace 30분부터 3분 | 기준 상황 |
-| `coder60` | 같은 trace 60분부터 3분 | 4 |
-| `apib` | Alibaba api(B) 30분부터 5분 | 4 |
-| `chata` | Alibaba chat(A) 30분부터 9분 | 4 |
-| `qwen3-14b` | key 하나 40 MiB | 기준 상황 |
-| `ds-v3` | key 하나 17 MiB (MLA) | 4 |
-| `llama-70b` | key 하나 80 MiB | 4 |
+| 이름 | 무엇 |
+|---|---|
+| `coder` | trace — Alibaba coder 30분부터 3분 |
+| `coder60` | trace — 같은 trace 60분부터 3분 |
+| `apib` | trace — Alibaba api(B) 30분부터 5분 |
+| `chata` | trace — Alibaba chat(A) 30분부터 9분 |
+| `qwen3-14b` | 모델 — key 하나 40 MiB |
+| `ds-v3` | 모델 — key 하나 17 MiB (MLA) |
+| `llama-70b` | 모델 — key 하나 80 MiB |
 
 ## 도구가 재는 것
 
@@ -230,13 +245,13 @@ trace 파일은 `traces/`(Alibaba 공개 trace, Git LFS)에 있다. plan(재생�
 | 3FS 천장 대비 | `of_3fs_load` · `of_3fs_store` | `3FS 천장 대비` |
 | 무효 | `valid` (storage 재시작 · 멈춤 · 출발 늦음) | `!! 무효` |
 
-- 실행 폴더: `results/tune-speed/<adapter>[-trace][-model]/runs/<knob>+<설정>-x<배속>/` (`summary.json` · `driver-<호스트>.json` · `raw-<호스트>.jsonl` = 노드마다 1초 간격 카운터)
+- 실행 폴더: `results/tune-<규칙>/<adapter>[-trace][-model]/runs/<knob>+<설정>-x<배속>/` (`summary.json` · `driver-<호스트>.json` · `raw-<호스트>.jsonl` = 노드마다 1초 간격 카운터)
 - 한 실행의 한 줄: `python3 tune/analyze.py <실행 폴더>`
-- 모든 값: `python3 tune/analyze.py --json results/tune-speed/metrics-<tag>.json <실행 폴더>` 로 쓰고 그 파일을 읽는다
+- 모든 값: `python3 tune/analyze.py --json results/tune-<규칙>/metrics-<tag>.json <실행 폴더>` 로 쓰고 그 파일을 읽는다
 
 ## 결과 보고
 
-`python3 tune/agent.py report` 가 보고 표를 만든다(`results/tune-speed/report-<시각>.md` 에도 쓴다). 그 출력을 고치지 않고 그대로 보내고, 맨 아래 두 줄만 채운다.
+`python3 tune/agent.py report` 가 보고 표를 만든다(`results/tune-<규칙>/report-<시각>.md` 에도 쓴다). 그 출력을 고치지 않고 그대로 보내고, 맨 아래 두 줄만 채운다.
 
 - `- 추정:` — 원인을 말하고 싶으면 여기에만, 짐작이라고 밝혀 쓴다. 없으면 "없음"
 - `- 무효 · 멈춘 실행:` — `status` · 로그에서 본 `!! 무효` · 멈춤의 tag 와 이유. 없으면 "없음"
@@ -245,11 +260,11 @@ trace 파일은 `traces/`(Alibaba 공개 trace, Git LFS)에 있다. plan(재생�
 
 | 칸 | 뜻 |
 |---|---|
-| 가장 좋은 knob+설정 | 그 trace x 모델에서 최대 배속이 가장 높았던 조합 |
+| 가장 좋은 knob+설정 | 그 상황에서 그 adapter 의 최대 배속이 가장 높았던 조합 |
 | `x3.48 3/3 · 위 x4 0/3 store` | x3.48 에서 세 번 중 세 번 통과, 그 위 칸 x4 에서 세 번 중 0 번, 막힌 쪽은 store |
 | `(경계 확인 전)` | 최대나 그 위 칸을 세 번 다 재지 않았다 — "최대"라고 단정하지 않는다 |
-| base 에서 잰 knob | 그 trace x 모델에서 search 가 끝난 knob 수 / 전체 |
-| 계획 단계 n/27 끝 | 27 이 아니면 "다 했다"고 쓰지 않는다 |
+| 잰 knob(거르기 포함) | 거르기나 search 로 한 번이라도 잰 knob 수 / 전체 — 전체가 아니면 거르기가 덜 끝났다 |
+| 계획 단계 n/m 끝 | n 이 m 이 아니면 "다 했다"고 쓰지 않는다 |
 
 knob 하나하나의 결과는 `python3 tune/agent.py coverage --trace <trace> --model <모델>` 이다.
 
