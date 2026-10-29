@@ -281,6 +281,9 @@ def check():
     t = json.loads(tfs.read_text()) if tfs.exists() else None
     print("  -- 3FS 경로 천장 " + (f"읽기 {t['read_gibps']:.2f} · 쓰기 {t['write_gibps']:.2f} GiB/s ({t['measured_at']})" if t
                                   else "없음 — python3 ceiling.py 로 잰다"))
+    hw = (t or {}).get("hardware")
+    print("  -- 하드웨어 천장 " + (f"읽기 {hw['read_gibps']:.2f} · 쓰기 {hw['write_gibps']:.2f} GiB/s(먼저 차는 곳 {hw['read_wall']} · {hw['write_wall']})" if hw
+                               else "없음 — python3 ceiling.py 가 함께 계산한다"))
     print("통과" if not bad else f"안 된 것 {len(bad)}: " + ", ".join(bad))
     return not bad
 

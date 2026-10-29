@@ -15,6 +15,25 @@
 
 LMCache 를 올릴 때: 바뀐 commit 중 IO(lookup · load · store · L1 비우기 · prefetch 들이기)에 닿는 것을 보고 → `cache_sim.py` 규칙 · `driver.py` 를 고치고 → Spark 에서 `tune.py verify` → 이 표를 고친다.
 
+## 정해 둔 것
+
+| 무엇 | 정한 것 | 이유 |
+|---|---|---|
+| 천장 | 둘 — 하드웨어 구성 + 토폴로지로 계산한 것, fio-usrbio 로 잰 3FS 경로 천장 (`ceiling.py`) | 하드웨어 천장이 장비의 벽이고, fio-usrbio 는 3FS 소프트웨어 · 설정이 지금 낼 수 있는 양이다. 둘의 차이가 3FS 쪽에서 잃는 양이다 |
+| 측정 계획 | 하나 (`tune/agent.py plan`) | 짧게 돌리려면 adapter · trace · 모델을 정해 그것만 `agent.py start` 로 돈다 |
+| GPU 계산 시간 | 도구에 없다 — load 가 끝나면 그 request 의 store 를 바로 보낸다 | 넣어도 최대 배속이 같았다(아래 실험) |
+
+**GPU 계산 시간 실험** — Spark, hf3fs `s16-d16`, coder x Qwen3-14B, 클라이언트 3대. load 가 끝난 뒤 prefill 단계마다 GPU 가 계산할 시간을 기다렸다 그 단계의 store 를 보내 봤다. GPU 는 일부러 느리게(prefill 20,000 token/s) 잡았다.
+
+| 배속 | 계산 시간 없음: store 비율 · 늦음 p99 | 계산 시간 있음 |
+|---|---|---|
+| x4 | 0.98 · 0.03초 → 통과 | 0.95 · 0.05초 → 통과 |
+| x4.59 | 0.93 · 0.21초 → 실패 | 0.91 · 0.34초 → 실패 |
+| x5.28 | 0.78 · 1.72초 → 실패 | 0.77 · 1.77초 → 실패 |
+| x8 | 0.50 · 9.64초 → 실패 | 0.48 · 7.45초 → 실패 |
+
+최대 배속은 둘 다 x4 다. 계산 시간을 넣으면 store 가 조금 늦게 끝날 뿐(비율 0.01-0.03) 통과 경계는 그대로다. GPU 가 빠를수록 기다림이 짧아져 차이는 더 작아진다.
+
 ## 왜 만드나
 
 실제 서비스 클러스터는 우리 손에 없고, 있어도 운영 중이라 실험할 수 없다.
@@ -22,7 +41,7 @@ PoC 클러스터는 있지만 연산(GPU·통합 메모리)이 먼저 막혀서 
 그래서 PoC 에서는 "돌아간다"까지만 알 수 있고, 스토리지 최적화가 실제 클러스터에서 얼마나 효과가 있을지는 모른다.
 
 이 도구는 추론 엔진 없이 LMCache L2 adapter 를 직접 구동해, 공개 trace 가 만드는 3FS IO 를 **replay 배속을 올려 가며** 낸다.
-설정마다 따라가는 최대 배속을 찾아 견주고, 그때의 IO 를 3FS 경로 천장(fio-usrbio)과 디스크 천장에 대 본다.
+설정마다 따라가는 최대 배속을 찾아 견주고, 그때의 IO 를 하드웨어 천장(계산)과 3FS 경로 천장(fio-usrbio)에 대 본다.
 최적화 전·후를 같은 plan 으로 돌려 request 단위로 비교한다.
 
 ## 흐름
@@ -36,7 +55,7 @@ trace + serving config ─→ plan.py (cache_sim.py 로 request 마다 3FS load�
                                  ▼
 target spec (선택) ─────→ report.py (곡선, 대상 운영점, --baseline 과 request 단위 비교)
 
-ceiling.py (모든 클라이언트 fio-usrbio) ─→ clusters/<이름>-ceiling.json (3FS 경로 천장 — 결과의 "3FS 천장 대비")
+ceiling.py (하드웨어 계산 + 모든 클라이언트 fio-usrbio) ─→ clusters/<이름>-ceiling.json (하드웨어 천장 · 3FS 경로 천장 — 결과의 "3FS 천장 대비")
 ```
 
 ## 천장 대비 값
@@ -55,7 +74,7 @@ sweep 은 replay 배속으로 돈다. 천장은 결과를 3FS · 하드웨어가
 ## 쓰는 법
 
 ```bash
-python3 ceiling.py                                                     # 3FS 경로 천장 (처음 한 번, storage 설정을 바꾼 뒤)
+python3 ceiling.py                                                     # 하드웨어 천장 계산 + 3FS 경로 천장 (처음 한 번, storage 설정을 바꾼 뒤)
 python3 plan.py alibaba-coder --out plans/coder                        # 기본 배속 0.5,1,2,3,4,max
 python3 plan.py alibaba-coder --serving-cfg targets/<서빙 설정>.json --out plans/coder-l1big
 python3 replay.py plans/coder --out results/coder                      # 배속을 차례로
@@ -76,7 +95,7 @@ trace: `alibaba-chat(A)` `alibaba-api(B)` `alibaba-thinking` `alibaba-coder` `mo
 | `report.py` | 곡선, 대상 운영점, request 단위 A/B |
 | `driver.py` | 클라이언트 한 대의 실행기 (`--mode replay`. `run`·`calibrate`·`prepare` 는 한계 측정용) |
 | `hw_probe.py` / `hw_sampler.py` | 장비별 CPU·디스크·RDMA·NIC 카운터, 제한 없는 최대 부하 시험 |
-| `ceiling.py` | 3FS 경로 천장 — 모든 클라이언트가 같은 시각에 fio-usrbio(1 MiB, iodepth 32)로 덮어쓰고 읽은 합 |
+| `ceiling.py` | 천장 둘 — 하드웨어 천장(NVMe 사양값 · 노드마다 선로 속도 · target 이 든 디스크 · 복제 수로 계산, 디스크 · storage 선로 · 클라이언트 선로 중 먼저 차는 곳)과 3FS 경로 천장(모든 클라이언트가 같은 시각에 fio-usrbio(1 MiB, iodepth 32)로 덮어쓰고 읽은 합) |
 | `traces.py` | trace 목록과 prompt 만들기 (`hash_ids` → token) |
 | `calibration.json` | 소프트웨어의 성질(object 모양, adapter)과 PoC 실측 기록. 클러스터마다 다른 값은 `cluster.py` 가 그 클러스터의 것으로 덮어 driver 에 보낸다 |
 | `cluster.py` · `clusters/` | 클러스터 고유 값(호스트 · 계정 · 3FS 경로 · storage node · NIC · NVMe · 천장 · 바꿔도 되는 것)은 모두 `clusters/<이름>.toml` 에 있다. `discover` · `check` · `env`. "다른 클러스터로 옮기기" |
@@ -100,7 +119,7 @@ replay 는 실행마다 이 장비의 `driver.py` 를 다른 클라이언트의 
 3. `SM_CLUSTER=<이름> python3 cluster.py discover <이름>` — admin_cli(`list-nodes` · `list-clients` · `list-chains` · FUSE 템플릿 · storage 설정)와 각 노드(RDMA 포트가 ACTIVE 인 NIC · NVMe · 마운트 · python · 도구 사본 · FUSE 서비스와 로그)에서 찾은 값으로 초안을 다시 내고, 지금 FUSE 템플릿을 되돌릴 곳으로 받아 둔다. admin_cli · admin_host 가 비어 있으면 3FS 기본 설치 경로와 이 장비로 해 본다
 4. 초안의 빈칸과 `# 확인` 을 사람이 채운다. `[allow]` 는 클러스터 주인에게 묻는다. 디스크 · 링크 천장은 선택이다 — 적으면 사용률(%)이 나오고, 사양값이면 그렇게 적어 둔다
 5. `python3 cluster.py check` 가 "통과", `python3 tune/settings.py home` 이 "HOME 과 같다"
-6. `python3 ceiling.py` 로 3FS 경로 천장을 잰다. fio-usrbio 가 없으면 3FS 소스의 `benchmarks/fio_usrbio` 로 빌드하고 경로를 `[builds]` 에 적는다
+6. `python3 ceiling.py` 로 천장 둘을 낸다. 하드웨어 천장은 `[hardware]` 에 NVMe 한 개의 사양값(순차 읽기 · 쓰기 GB/s)을 적어야 디스크까지 센다 — 비우면 선로만으로 계산하고 NVMe 모델 이름을 찍는다. fio-usrbio 가 없으면 3FS 소스의 `benchmarks/fio_usrbio` 로 빌드하고 경로를 `[builds]` 에 적는다
 7. `python3 tune/tune.py sweep hf3fs --trace coder` 처럼 돌린다(adapter 는 `nixl_store_dynamic` · `nixl_native` · `hf3fs`, 첫 배속 x1 — `--start` 로 바꾼다). 허락이 없는 쪽을 바꾸는 설정은 건너뛰고, 기준도 그쪽은 지금 값으로 둔다
 
 - **FUSE 템플릿은 mgmtd 에 하나라 그 클러스터의 모든 FUSE 클라이언트에 걸린다.** `list-clients` 에 목록 밖 클라이언트가 보이면 도구가 템플릿을 바꾸지 않는다

@@ -81,6 +81,11 @@ chunk_bytes = ""
 # client_load_wall_gibps = ""   # (선택) 클라이언트 한 대 load · store 한계. plan.py 가 넘는 배속을 빼고 "max" 를 정한다. 없으면 자르지 않는다
 # client_store_wall_gibps = ""
 
+# 하드웨어 천장(ceiling.py 가 계산한다)에 쓰는 사양값. ceiling.py 가 NVMe 모델 이름을 찍는다 — 그 모델 사양서의 값을 적는다
+[hardware]
+nvme_read_gbps = ""           # NVMe 한 개의 순차 읽기(GB/s, 사양서). 비우면 디스크를 빼고 선로만으로 계산한다
+nvme_write_gbps = ""          # 순차 쓰기
+
 # (선택) 대당 미리 쓰기 속도 어림(GiB/s) — replay 의 출발 시각. 없으면 PoC 값(dram 0.35 · dram_zc 1.2 · hf3fs 1.5).
 # 느리게 잡으면 출발만 늦고, 빠르게 잡으면 미리 쓰기가 덜 끝나 그 실행이 무효다
 # [prepop_gibps]

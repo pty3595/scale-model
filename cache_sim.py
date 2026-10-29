@@ -191,13 +191,11 @@ class CacheSim:
             left -= steps[-1]
         steps += [1] * (max_tokens - 1)
         batches, end, sched = [], s0 + p1 + p2, 0
-        after = []                                           # 묶음마다 그때까지 새로 계산한 토큰 (GPU 계산 시간 넣기용)
         for st in steps:
             sched += st
             new_end = min(n, (sched + base) // self.chunk)
             if new_end > end:
                 batches.append(ck[end:new_end])
-                after.append(sched)
                 end = new_end
         labels = ["gpu"] * s0 + ["L1"] * p1 + ["L2" if x else "lost" for x in from_l2]
         stored = [k for b in batches for k in b]
@@ -250,5 +248,4 @@ class CacheSim:
             self._evict_check(locked=set(stored))
         # mode == "next": 다음 요청이 시작할 때 그 요청의 검사에서 비운다
         return {"labels": labels, "gpu_hit_tokens": h, "p1": p1, "p2": p2, "s0": s0, "loaded": load, "store_batches": batches,
-                "store_after_tokens": after,
                 "lookup_from": p1 if self.rules == "a44d5e5" else s0}        # L2 lookup 이 묻는 첫 청크

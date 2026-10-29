@@ -171,30 +171,22 @@
 | 2 | `SM_CLUSTER=<이름> python3 cluster.py discover <이름>` | 초안. 빈칸과 `# 확인` 줄을 목록으로 사용자에게 보여 주고 사람이 채운다. 추측해서 채우지 않는다 |
 | 3 | `python3 cluster.py check` | 마지막 줄 "통과" |
 | 4 | `python3 tune/settings.py home` | "HOME 과 같다" |
-| 5 | `python3 ceiling.py` | `clusters/<이름>-ceiling.json`. 데이터는 storage RAM 합의 두 배로 저절로 정해진다. fio 읽기 · 쓰기 합과 같은 구간의 storage 디스크 읽기 · 쓰기를 함께 보고한다. `!! 읽기에서 storage 디스크가 fio 보다 …` 가 나오면 캐시에서 읽은 것이다 — 그 줄과 storage 데이터 폴더의 파일시스템(`stat -f -c %T <폴더>`, ZFS 면 캐시를 거친다)을 보고한다. storage 설정이 바뀐 뒤에만 다시. fio-usrbio · 엔진이 없다고 하면 "설치" 5 |
+| 5 | `python3 ceiling.py` | `clusters/<이름>-ceiling.json`. 천장 둘을 보고한다: 하드웨어 계산(`하드웨어 read · write` 줄과 먼저 차는 곳)과 fio-usrbio 로 잰 3FS 경로(`read 합` · `write 합`), 그리고 `fio ÷ 하드웨어`. `!! 디스크 사양값이 없어` 가 나오면 그 줄의 NVMe 모델을 사용자에게 보여 주고 사양서의 순차 읽기 · 쓰기(GB/s)를 받아 `[hardware]` 에 적은 뒤 다시 돌린다. 추측해서 적지 않는다. storage 설정이 바뀐 뒤에만 다시. fio-usrbio · 엔진이 없다고 하면 "설치" 5 |
 
 ## 측정
 
 ### 계획
 
-계획은 셋 중 하나다. 사용자가 쓸 수 있는 시간을 말하면 그에 맞는 것을 고르고, 말하지 않으면 묻는다. 고른 계획은 `python3 tune/agent.py plan --profile <이름>` 으로 한 번 정하면 `next` · `report` 가 그것을 쓴다.
-
-| 계획 | 언제 | 기준 상황(coder x Qwen3-14B) knob | 클러스터 설정 | 다른 상황 | 어림 |
-|---|---|---|---|---|---|
-| `short` | 반나절 | adapter 마다 둘(문서 예시 · Spark 에서 가장 좋았던 것) | 없음 | Llama(key 가장 큼), 가장 좋은 knob | 2-7시간 |
-| `normal` | 하루 | adapter 셋의 knob 전부(21) | 가장 좋은 knob 에서 다섯 | DeepSeek · Llama · api(B), 가장 좋은 knob | 11-34시간 |
-| `long` | 이틀 넘게 | knob 전부 | 다섯 | normal + chat(A) · coder 60분, DeepSeek · Llama 는 knob 전부 | 22-66시간 |
-
 `python3 tune/agent.py plan` 이 단계마다 끝 · 남음 · 기다림과 남은 시간 어림을 보인다. 단계는 아래 순서이고, 앞 단계 결과로 다음 단계의 knob · 설정을 도구가 고른다.
 
-| 단계 | 무엇 |
-|---|---|
-| 1 knob | 기준 상황(클러스터 `base`)에서 adapter 셋의 knob — 계획마다 다르다 |
-| 2 클러스터 설정 | adapter 마다 1 의 가장 좋은 knob 에서 클러스터 설정(`[allow]` 가 없는 것은 도구가 뺀다). `short` 에는 없다 |
-| 3 경계 확인 | adapter 마다 가장 좋은 조합의 최대 배속과 그 위 한 칸을 두 번씩 더 |
-| 4 다른 상황 | 계획의 다른 trace · 모델 |
+| 단계 | 무엇 | search 수 |
+|---|---|---|
+| 1 knob 전부 | 기준 상황(coder x Qwen3-14B, 클러스터 `base`)에서 adapter 셋의 knob 전부 | 21 |
+| 2 클러스터 설정 | adapter 마다 1 의 가장 좋은 knob 에서 클러스터 설정 다섯(`[allow]` 가 없는 것은 도구가 뺀다) | 15 이하 |
+| 3 경계 확인 | adapter 마다 가장 좋은 조합의 최대 배속과 그 위 한 칸을 두 번씩 더 | 실행 12 |
+| 4 다른 trace · 모델 | 아래 다섯 상황에서 adapter 마다 1 의 가장 좋은 knob | 15 |
 
-사람이 끊지 않는 한 고른 계획이 다 끝날 때까지 이어 간다. 계획을 줄이거나 단계를 건너뛰지 않는다 — 시간이 모자라면 사용자에게 더 짧은 계획으로 바꿀지 묻는다.
+search 하나가 15-45분(어림)이라 계획 전체는 13-39시간쯤 걸린다. 사람이 끊지 않는 한 계획이 다 끝날 때까지 이어 간다. 계획을 줄이거나 단계를 건너뛰지 않는다 — 사용자가 adapter · trace · 모델을 콕 집어 시키면 그때만 그것을 `agent.py start` 로 돈다(knob 목록은 `agent.py coverage --trace T --model M`).
 
 ### 되풀이
 

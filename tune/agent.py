@@ -5,8 +5,7 @@
 
   agent.py install      클라이언트마다 adapter 셋 · NIXL HF3FS plugin · pwrite shim 이 있고 빌드가 같은지. 실패면 종료 코드 1
   agent.py check        측정 전 점검. 하나라도 실패면 종료 코드 1
-  agent.py plan [--profile short|normal|long]
-                        측정 계획의 단계마다 끝났나 · 남았나 · 남은 시간. 계획을 주면 저장하고 next · report 가 그것을 쓴다(처음은 normal)
+  agent.py plan         측정 계획의 단계마다 끝났나 · 남았나 · 남은 시간 어림
   agent.py next         점검을 통과하면 계획에서 아직 안 끝난 첫 단계를 띄운다(터미널이 끊겨도 돈다)
   agent.py status       돌고 있는 측정, 끝난 실행 줄(버림 포함), 끝났는지
   agent.py stop         agent.py 가 띄운 측정만 멈추고 HOME 으로 돌아왔는지 본다
@@ -39,22 +38,14 @@ RUN_LINE = re.compile(r" x[0-9.]+ +load ")
 NOT_RUN = {"raw_hf3fs": "RUNBOOK: raw_hf3fs 는 돌리지 않는다(3FS 소스 빌드가 필요하고, 그 PR 의 test 는 클러스터의 모든 chunk 를 지운다)"}
 AD = ["hf3fs", "nixl_store_dynamic", "nixl_native"]   # 잴 adapter 와 순서 — hf3fs 가 기준
 
-# --- 측정 계획 (Spark 에서 정했다) — short · normal · long 중 하나를 고른다 ---
-# 1 기준 상황(coder x Qwen3-14B, 클러스터 base)에서 adapter 셋의 knob — adapter 끼리 견주는 것이 이 도구의 목적이라 셋 다 잰다
-# 2 adapter 마다 1 의 가장 좋은 knob 에서 클러스터 설정(허락된 것)
+# --- 측정 계획 (Spark 에서 정했다, 10-28) ---
+# 1 기준 상황(coder x Qwen3-14B, 클러스터 base)에서 adapter 셋의 knob 전부 — adapter 끼리 견주는 것이 이 도구의 목적이라 셋 다 잰다
+# 2 adapter 마다 가장 좋은 knob 에서 클러스터 설정(허락된 것) — tune.py 의 기본 후보
 # 3 adapter 마다 가장 좋은 조합의 최대 배속과 그 위 한 칸을 두 번씩 더(세 번 중 두 번으로 경계를 정한다)
-# 4 다른 trace · 모델. Spark 에서 모델(key 크기)이 바뀌면 adapter 순위와 가장 좋은 knob 이 바뀌었다 → long 은 모델 상황에서 knob 전부.
-#   trace 를 바꿨을 때 순위가 바뀌는지는 hf3fs 만 재서 모른다. 같은 trace 의 다른 구간(coder60)과 가장 오래 걸리는 chata 는 long 에만
+# 4 다른 trace · 모델에서 adapter 마다 1 의 가장 좋은 knob(클러스터 base). Spark 에서 모델마다 가장 좋은 knob 이 달랐다 — 시간 때문에 하나만
 BASE_WL = ("coder", "qwen3-14b")
 SETS = ["b1m", "r32-1m", "r6", "rts", "c512k"]          # 클러스터 설정 후보 — FUSE 재시작이 필요한 쓰기 설정(w32 · src-w32)은 뺀다
-SHORT_KNOBS = {"hf3fs": ["doc", "s16-d16"], "nixl_store_dynamic": ["auto", "dram_zc"], "nixl_native": ["w4", "w16-a4k"]}   # 문서 예시 + Spark 에서 가장 좋았던 것
-PROFILES = {
-    "short": dict(knobs=SHORT_KNOBS, sets=[], other=[("coder", "llama-70b")], all_knobs_for=()),
-    "normal": dict(knobs=None, sets=SETS, other=[("coder", "ds-v3"), ("coder", "llama-70b"), ("apib", "qwen3-14b")], all_knobs_for=()),
-    "long": dict(knobs=None, sets=SETS, other=[("coder", "ds-v3"), ("coder", "llama-70b"), ("apib", "qwen3-14b"), ("chata", "qwen3-14b"),
-                                              ("coder60", "qwen3-14b")], all_knobs_for=("ds-v3", "llama-70b")),
-}
-PROFILE_FILE = T.OUT / "agent-profile"                    # 마지막으로 고른 계획 — plan · next · report 가 따로 받지 않으면 이것을 쓴다
+OTHER = [("coder", "ds-v3"), ("coder", "llama-70b"), ("apib", "qwen3-14b"), ("chata", "qwen3-14b"), ("coder60", "qwen3-14b")]
 SEARCH_H = (0.25, 0.75)                                   # search 하나의 시간(어림, Spark: 최대 x1 위면 15-25분, x0.5 아래면 1시간 가까이)
 
 def folder(adapter, trace, model):
@@ -112,33 +103,20 @@ def best_tag(res, tags):
     return max(done)[2] if done else None
 
 
-def profile(args):
-    """--profile 을 받으면 저장하고, 아니면 저장된 것(없으면 normal)"""
-    name = opt(args, "--profile")
-    if name:
-        if name not in PROFILES:
-            raise SystemExit(f"계획은 {', '.join(PROFILES)} 중 하나")
-        PROFILE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        PROFILE_FILE.write_text(name)
-        return name
-    return PROFILE_FILE.read_text().strip() if PROFILE_FILE.exists() else "normal"
-
-
-def steps(prof):
+def steps():
     """계획의 단계: (이름, adapter, trace, model, tune.py 인자 | None(앞 단계를 기다림), 끝났나, 설명, 남은 search 수)"""
-    P_ = PROFILES[prof]
     out = []
     tr, mo = BASE_WL
     bk = {}
     for a in AD:
         res = results(a, tr, mo)
-        ks = (P_["knobs"] or {}).get(a) or list(T.ADAPTERS[a]["knobs"])
+        ks = list(T.ADAPTERS[a]["knobs"])
         left = [k for k in ks if not search_done(res, f"{k}+base")]
-        out.append(("1 knob", a, tr, mo, [a, "--knobs", ",".join(ks), "--trace", tr, "--model", mo, "--settings", "base"],
+        out.append(("1 knob 전부", a, tr, mo, [a, "--knobs", ",".join(ks), "--trace", tr, "--model", mo, "--settings", "base"],
                     not left, f"knob {len(ks) - len(left)}/{len(ks)}", len(left)))
         bk[a] = None if left else best_tag(res, [f"{k}+base" for k in ks]).split("+")[0]
-    sets = [x for x in P_["sets"] if allowed_setting(x)]
-    skip = [x for x in P_["sets"] if x not in sets]
+    sets = [x for x in SETS if allowed_setting(x)]
+    skip = [x for x in SETS if x not in sets]
     for a in AD if sets else []:
         res, k = results(a, tr, mo), bk[a]
         left = [x for x in sets if not (k and search_done(res, f"{k}+{x}"))]
@@ -159,28 +137,26 @@ def steps(prof):
             out.append((f"3 경계 확인({which})", a, tr, mo, args, done,
                         (f"{combo} x{sp:g} {len(n)}번 잼" if sp else ("통과한 배속 없음 — 건너뜀" if combo else "앞 단계를 기다린다")),
                         0 if done else 0.3))
-    for tr2, mo2 in P_["other"]:
+    for tr2, mo2 in OTHER:
         for a in AD:
-            res = results(a, tr2, mo2)
-            ks = list(T.ADAPTERS[a]["knobs"]) if mo2 in P_["all_knobs_for"] else ([bk[a]] if bk[a] else [])
-            left = [k for k in ks if not search_done(res, f"{k}+base")]
-            out.append(("4 다른 상황", a, tr2, mo2,
-                        [a, "--knobs", ",".join(ks), "--trace", tr2, "--model", mo2, "--settings", "base"] if ks else None,
-                        bool(ks) and not left, (f"knob {len(ks) - len(left)}/{len(ks)}" if len(ks) > 1 else f"knob {ks[0]}") if ks else "1 단계를 기다린다",
-                        len(left) if ks else (len(T.ADAPTERS[a]["knobs"]) if mo2 in P_["all_knobs_for"] else 1)))
+            k = bk[a]
+            done = bool(k) and search_done(results(a, tr2, mo2), f"{k}+base")
+            out.append(("4 다른 trace · 모델", a, tr2, mo2,
+                        [a, "--knobs", k, "--trace", tr2, "--model", mo2, "--settings", "base"] if k else None,
+                        done, f"knob {k}" if k else "1 단계를 기다린다", 0 if done else 1))
     return out
 
 
-def plan(prof):
-    st = steps(prof)
+def plan():
+    st = steps()
     left = [x for x in st if not x[5]]
-    print(f"계획: {prof}  (short · normal · long — `agent.py plan --profile <이름>` 으로 바꾼다)")
     for name, a, tr, mo, args, done, note, _ in st:
         print(f"[{'끝' if done else '남음' if args else '기다림'}] {name:16} {a:19} {tr:8} {mo:10} {note}")
     n = sum(x[7] for x in left)
     print(f"→ 남은 단계 {len(left)}/{len(st)}" + (" — 계획이 다 끝났다. agent.py report 로 보고한다" if not left else
           f", 남은 search 약 {n:.0f}개 — 약 {n * SEARCH_H[0]:.0f}-{n * SEARCH_H[1]:.0f}시간(어림)"))
     return left
+
 
 # --- 설치 확인 ---
 NEED = {   # adapter 가 import 하는 것 — 하나라도 없으면 그 adapter 는 못 돈다
@@ -325,12 +301,12 @@ def launch(args, what):
     print("10-20분마다 `python3 tune/agent.py status` 로 본다. 끝나면(→ 끝났다) `agent.py next` 로 다음 단계를 띄운다")
 
 
-def next_step(prof):
-    for name, a, tr, mo, args, done, note, _ in steps(prof):
+def next_step():
+    for name, a, tr, mo, args, done, note, _ in steps():
         if not done:
             if args is None:
                 raise SystemExit(f"{name} {a} 는 앞 단계를 기다린다 — agent.py plan 출력을 사용자에게 보고한다")
-            return launch(args, f"{prof} · {name} · {a} · {tr} x {mo} · {note}")
+            return launch(args, f"{name} · {a} · {tr} x {mo} · {note}")
     print("계획이 다 끝났다 — `python3 tune/agent.py report` 로 보고한다")
 
 
@@ -444,13 +420,19 @@ def coverage(trace, model):
     print(f"→ base 에서 search 가 끝난 knob {done}/{total}" + (" — 다 쟀다" if done == total else " — 안 잰 것이 있다. '다 했다'고 하지 않는다"))
 
 
-def report(prof):
-    st = steps(prof)
+def report():
+    st = steps()
     left = [s for s in st if not s[5]]
+    tfs = C.DIR / f"{C.PATH.stem}-ceiling.json"
+    t = json.loads(tfs.read_text()) if tfs.exists() else {}
+    hw = t.get("hardware")
+    ceil = ("천장 GiB/s: " + (f"fio-usrbio 읽기 {t['read_gibps']:.2f} · 쓰기 {t['write_gibps']:.2f}" if t else "fio-usrbio 없음(ceiling.py)")
+            + (f" / 하드웨어 계산 읽기 {hw['read_gibps']:.2f} · 쓰기 {hw['write_gibps']:.2f}(먼저 차는 곳 {hw['read_wall']} · {hw['write_wall']})" if hw
+               else " / 하드웨어 계산 없음"))
     out = [f"## {time.strftime('%Y-%m-%d')} {C.NAME} 측정 결과", "",
-           f"계획 {prof} 단계 {len(st) - len(left)}/{len(st)} 끝" + (" — 계획이 다 끝났다" if not left else f" — 남은 단계 {len(left)}개(agent.py plan). 다 끝났다고 쓰지 않는다"),
-           f"클러스터 설정 허락: FUSE 템플릿 {C.allowed('fuse_template')} · storage hot-update {C.allowed('storage_hot_update')}", ""]
-    for tr, mo in [BASE_WL] + PROFILES[prof]["other"]:
+           f"계획 단계 {len(st) - len(left)}/{len(st)} 끝" + (" — 계획이 다 끝났다" if not left else f" — 남은 단계 {len(left)}개(agent.py plan). 다 끝났다고 쓰지 않는다"),
+           f"클러스터 설정 허락: FUSE 템플릿 {C.allowed('fuse_template')} · storage hot-update {C.allowed('storage_hot_update')}", ceil, ""]
+    for tr, mo in [BASE_WL] + OTHER:
         rows = []
         for a in AD:
             res = results(a, tr, mo)
@@ -490,9 +472,9 @@ def main():
     elif cmd == "check":
         sys.exit(0 if check() else 1)
     elif cmd == "plan":
-        plan(profile(a))
+        plan()
     elif cmd == "next":
-        next_step(profile(a))
+        next_step()
     elif cmd == "start":
         start(a[1:])
     elif cmd == "status":
@@ -500,7 +482,7 @@ def main():
     elif cmd == "stop":
         stop()
     elif cmd == "report":
-        report(profile(a))
+        report()
     elif cmd == "coverage":
         coverage(opt(a, "--trace") or BASE_WL[0], opt(a, "--model") or BASE_WL[1])
     else:

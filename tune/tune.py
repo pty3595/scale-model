@@ -209,9 +209,8 @@ def data_dir(adapter, knob, chunk, wm=""):
 
 # --- sweep ---
 class Sweep:
-    def __init__(self, adapter, wl="coder", model="qwen3-14b", ev=None, n=None, prefill_tps=0):
+    def __init__(self, adapter, wl="coder", model="qwen3-14b", ev=None, n=None):
         self.adapter, self.v = adapter, ADAPTERS[adapter]
-        self.prefill_tps = prefill_tps
         n = n or self.v.get("clients") or len(C.CLIENTS)
         if self.v.get("clients") and n != self.v["clients"]:
             raise SystemExit(f"{adapter} 는 클라이언트 {self.v['clients']}대로만 돈다(--clients {self.v['clients']}) — key 표가 프로세스 안에만 있다")
@@ -223,7 +222,7 @@ class Sweep:
                 raise SystemExit(f"chain {chains}개 ≠ 기본 stripe {STRIPE} — raw_hf3fs 의 chunk 가 재생 폴더의 layout 밖 chain 에 남는다")
         self.fam = family(self.v["rules"], wl, model, ev, n)
         self.wm = (("" if wl == "coder" else f"-{wl}") + ("" if model == "qwen3-14b" else f"-{model}") + (f"-ev{ev.replace('/', '-')}" if ev else "")
-                   + ("" if n == len(C.CLIENTS) else f"-n{n}") + (f"-p{prefill_tps:g}" if prefill_tps else ""))
+                   + ("" if n == len(C.CLIENTS) else f"-n{n}"))
         self.out = OUT / f"{adapter}{self.wm}"
         (self.out / "runs").mkdir(parents=True, exist_ok=True)
         self.res_path = self.out / "result.json"
@@ -254,8 +253,7 @@ class Sweep:
                + (f" --python '{py}'" if py else "")
                + (f" --prefix '{prefix}'" if prefix else "")
                + (f" --l1-align {c['l1a']}" if c.get("l1a") else "")
-               + "".join(f" --backend-param {kv}" for kv in c.get("bp", []))
-               + (f" --prefill-tps {self.prefill_tps:g}" if self.prefill_tps else ""))
+               + "".join(f" --backend-param {kv}" for kv in c.get("bp", [])))
         with open(f"{out}.log", "w") as lf:
             subprocess.run(["bash", "-c", cmd], stdout=lf, stderr=subprocess.STDOUT, check=True)
         if json.loads((out / "summary.json").read_text()).get("storage_restart"):
@@ -441,8 +439,6 @@ def main():
     ap.add_argument("--rep-start", type=int, default=2, help="--repeat 의 tag 첫 번호(.rN) — 앞서 쓴 번호와 겹치지 않게")
     ap.add_argument("--set-start", type=float, help="클러스터 설정 search 의 첫 배속(기본: adapter 설정의 최대 배속)")
     ap.add_argument("--evict", help="L1 비우기 문턱/비율(LMCache 기본 0.8/0.2). plan 을 시뮬레이터로 다시 낸다(IO 양이 바뀐다)")
-    ap.add_argument("--prefill-tps", type=float, default=0,
-                    help="GPU prefill 속도(token/s) — 주면 load 뒤 prefill 단계마다 그만큼 기다렸다 store 를 보낸다. 결과 폴더에 -p<값>")
     ap.add_argument("--clients", type=int, help="클라이언트 수(기본: 그 adapter 가 정한 수, 없으면 [[client]] 전부). 같은 trace 구간을 그 대수가 나눠 받는다")
     args = ap.parse_args()
     if args.cmd == "table":
@@ -456,7 +452,7 @@ def main():
         raise SystemExit("클러스터가 되돌릴 곳에 있지 않다 — 되돌리면 지금 값을 지운다. 확인하고 맞춘 뒤 다시: " + "; ".join(bad))
     for s in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(s, lambda *_: sys.exit(1))
-    sw = Sweep(args.adapter, args.trace, args.model, args.evict, args.clients, args.prefill_tps)
+    sw = Sweep(args.adapter, args.trace, args.model, args.evict, args.clients)
     knobs = args.knobs.split(",") if args.knobs else list(sw.v["knobs"])
     try:
         start = on_grid(args.start or START)

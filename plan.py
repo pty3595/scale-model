@@ -93,16 +93,15 @@ def simulate(trace: str, start_min: float, minutes: float, clients: int, cfg: di
         loads = [c for c, x in zip(ck, labels) if x == "L2"]
         stores = {c for c, x in zip(ck, labels) if x == "store"}
         batches = [[key(c) for c in b if c in stores] for b in res["store_batches"]]
-        after = [a for b, a in zip(batches, res["store_after_tokens"]) if b]
         for c in ck[s0 + p1:s0 + p1 + p2]:            # lookup 이 찾는 chunk (L1 에 남아 있어 읽지 않는 것도)
             if c not in stored_in_window:
                 prepop[cl].add(key(c))
         stored_in_window.update(stores)
         if lf < len(ck) or stores:
             # 4 번째는 대화 번호 — replay 가 한 클라이언트의 event 를 프로세스 여럿에 나눌 때 같은 대화를 한 프로세스에 둔다
-            # 5 번째는 도착 때 L1 사용률, 6 번째는 store 묶음마다 그때까지 새로 계산한 토큰
+            # 5 번째는 도착 때 L1 사용률
             events[cl].append([t - w0, [key(c) for c in ck[lf:]], [key(c) for c in loads], [b for b in batches if b],
-                               grp.setdefault(ck[0], len(grp)), round(l1_used, 4), after])
+                               grp.setdefault(ck[0], len(grp)), round(l1_used, 4)])
 
     seen = set()
     for p in prepop:                                  # 같은 chunk 를 두 클라이언트가 미리 쓰지 않게

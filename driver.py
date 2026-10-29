@@ -439,7 +439,7 @@ def replay(args) -> dict:
     out = {"host": socket.gethostname(), "mode": "replay", "client_index": args.client_index,
            "lmcache": str(pkg), "code": code, "l1_align": align,
            "trace": plan["trace"], "speed": plan["speed"], "events": len(events),
-           "prepopulate_chunks": len(prepop), "admission": adm, "prefill_tps": args.prefill_tps}
+           "prepopulate_chunks": len(prepop), "admission": adm}
     store_done = {}
 
     STALL_S = 180      # 이만큼 아무 것도 끝나지 않으면 멈춘 것으로 본다 (10-21: 먼저 끝난 클라이언트가 남의 store 를 깨뜨림 · 3FS 가 참)
@@ -488,11 +488,9 @@ def replay(args) -> dict:
 
         slots = [None] * slots_n if adm == "slots" else []      # lookup·load 중인 요청
         stores = {}                         # 진행 중인 store: task id -> (보낸 시각, chunk 수)
-        later = []                          # GPU 계산을 기다리는 store 묶음 (--prefill-tps): (보낼 시각, chunk 들)
 
         def new_slot(ev, now):
             return {"due": ev[0], "start": now, "look": ev[1], "want": set(ev[2]), "batches": ev[3],
-                    "after": ev[6] if len(ev) > 6 else [0] * len(ev[3]),
                     "loadq": None, "found": [], "task": None, "lookup_s": 0.0, "loaded": 0, "pending": 0}
 
         def can_admit(ev):
@@ -509,7 +507,7 @@ def replay(args) -> dict:
         layout = lm["layout_desc"]
         last_prog = time.perf_counter()
         # 끝 시각은 그 자리에서 다시 잰다 — adapter 가 lock 을 쥐고 동기 stat 을 하는 동안 adapter 호출이 막혀 루프 첫머리의 now 가 낡는다
-        while nxt < len(events) or any(slots) or stores or later:
+        while nxt < len(events) or any(slots) or stores:
             now = time.perf_counter() - base
             progressed = False
             # 때가 된 요청을 들인다 — 빈 슬롯에(slots) 또는 L1 바이트가 허락하는 만큼 차례대로(watermark)
@@ -525,12 +523,6 @@ def replay(args) -> dict:
                     slots.append(new_slot(events[nxt], now))
                     nxt += 1
                     progressed = True
-            # GPU 계산이 끝난 store 묶음을 보낸다
-            while later and later[0][0] <= now:
-                _, b = later.pop(0)
-                stores[adapter.submit_store_task(keys_of(b), objs_of(STORE, len(b)))] = (time.perf_counter() - base, len(b))
-                max_stores = max(max_stores, len(stores))
-                progressed = True
             # 끝난 store
             for tid, r in adapter.pop_completed_store_tasks().items():
                 t0, n = stores.pop(tid)
@@ -553,13 +545,8 @@ def replay(args) -> dict:
                     else:                                      # load 끝: unlock, store 를 보내고 슬롯을 비운다
                         if sl["found"]:
                             adapter.submit_unlock(sl["found"])
-                        if args.prefill_tps:                   # prefill 단계마다 GPU 가 그만큼 계산한 뒤에 그 단계의 store 를 보낸다
-                            t_done = time.perf_counter() - base
-                            later.extend((t_done + a / args.prefill_tps, b) for b, a in zip(sl["batches"], sl["after"]))
-                            later.sort(key=lambda x: x[0])
-                        else:
-                            for b in sl["batches"]:
-                                stores[adapter.submit_store_task(keys_of(b), objs_of(STORE, len(b)))] = (time.perf_counter() - base, len(b))
+                        for b in sl["batches"]:
+                            stores[adapter.submit_store_task(keys_of(b), objs_of(STORE, len(b)))] = (time.perf_counter() - base, len(b))
                         max_stores = max(max_stores, len(stores))
                         records.append({"due": sl["due"], "late": sl["start"] - sl["due"], "load_s": time.perf_counter() - base - sl["start"],
                                         "lookup_s": sl["lookup_s"], "looked": len(sl["look"]), "found": len(sl["found"]),
@@ -589,8 +576,7 @@ def replay(args) -> dict:
                 last_prog = time.perf_counter()
             else:
                 if time.perf_counter() - last_prog > STALL_S:
-                    out["stalled"] = {"stores": len(stores), "slots": sum(1 for x in slots if x), "events_left": len(events) - nxt,
-                                      "later": len(later)}
+                    out["stalled"] = {"stores": len(stores), "slots": sum(1 for x in slots if x), "events_left": len(events) - nxt}
                     log(f"[replay] {STALL_S}초 동안 진행이 없어 멈춘다: {out['stalled']}")
                     break
                 time.sleep(0.0005)
@@ -649,8 +635,6 @@ def main():
     ap.add_argument("--procs", type=int, default=1, help="이 클라이언트의 event 를 나눠 맡는 프로세스 수 (replay 전용)")
     ap.add_argument("--proc-index", type=int, default=0, help="그중 이 프로세스의 번호 (replay 전용)")
     ap.add_argument("--max-batch", type=int, default=64, help="load 한 번에 보낼 최대 chunk 수, 0 이면 request 당 task 하나 (replay 전용)")
-    ap.add_argument("--prefill-tps", type=float, default=0,
-                    help="GPU prefill 속도(token/s). 주면 load 가 끝난 뒤 prefill 단계마다 그만큼 기다렸다가 그 단계의 store 를 보낸다 (replay 전용, 0 이면 바로)")
     ap.add_argument("--load-rdonly", action="store_true", help="load 할 파일을 읽기 전용으로 연다 (replay 전용)")
     ap.add_argument("--adapter-json", default=None,
                     help="calibration 의 adapter 대신 쓸 adapter JSON. {dir} 는 --data-dir 로 바뀐다 (replay 전용). 예: hf3fs")
