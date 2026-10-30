@@ -97,7 +97,8 @@ def versions():
         f = l.split()
         if len(f) > 8:
             if f[8] in C.CLIENT_SET:
-                v[f[8]] = int(re.match(r"\d+", f[7]).group())     # 빌드에 따라 "0(uptodate)" 처럼 상태가 붙는다
+                # 빌드에 따라 "0(uptodate)" 처럼 상태가 붙는다. FUSE 를 다시 띄우면 예전 세션 줄이 한동안 남아 호스트마다 가장 큰 것(지금 세션)
+                v[f[8]] = max(v.get(f[8], 0), int(re.match(r"\d+", f[7]).group()))
             elif not (f[8] == "N/A" and f[0].rsplit("_", 2)[0] in C.CLIENT_SET):
                 others.append(f[8])     # 우리 raw_hf3fs connector(ClientId 호스트_pid_n, 호스트 N/A)는 FUSE 가 아니라 템플릿을 받지 않는다
     if others:
@@ -155,22 +156,25 @@ def push_fuse(c):
     src = C.fuse_template() if same else make_tpl(c, TMP / "fuse-tpl.toml")
     desc = "settings-" + "-".join(c[k].replace("/", "_") for k in FUSE_KEYS)
     C.admin(f"set-config --type FUSE --file {C.put_admin(src, '/tmp/sm-fuse-tpl.toml')} --desc {desc}")
-    for _ in range(60):
-        now = versions()
-        if all(now.get(h, 0) > v for h, v in before.items()):
-            break
-        time.sleep(2)
-    else:
-        # 10-22: FUSE 를 다시 띄우면 mgmtd 에 예전 세션이 남고, 같은 내용을 다시 올리면 새 버전이 안 생겨 이 확인이 실패한다.
-        # 맞는지는 아래의 실제 값 확인(FUSE 로그)이 가른다
-        log(f"  !! 템플릿 {desc} 를 모든 클라이언트가 받지 못했다({versions()}) — 실제 값으로 확인한다")
     want = literals(c)
     hit = lambda eff: all(all(e.get(p) == v for p, v in want.items()) for e in eff.values())
     eff = effective()
     restart = [p for k in RESTART_KEYS for p in FUSE[k] if any(e.get(p) != want[p] for e in eff.values())]
-    if restart:                               # 템플릿만으로는 안 바뀐다 — 기다리지 않고 다시 띄운다
+    if restart:
+        # 템플릿만으로는 안 바뀐다 — 기다리지 않고 다시 띄운다(새 FUSE 는 새 템플릿으로 뜬다).
+        # 10-31 Spark: 쓰기 둘이 다른 템플릿은 떠 있는 FUSE 의 설정 버전이 2분 넘게 오르지 않았다
         log(f"  FUSE 를 다시 띄워야 바뀐다: {', '.join('/'.join(p) for p in restart)}")
         restart_fuse()
+    else:
+        for _ in range(60):
+            now = versions()
+            if all(now.get(h, 0) > v for h, v in before.items()):
+                break
+            time.sleep(2)
+        else:
+            # 10-22: FUSE 를 다시 띄우면 mgmtd 에 예전 세션이 남고, 같은 내용을 다시 올리면 새 버전이 안 생겨 이 확인이 실패한다.
+            # 맞는지는 아래의 실제 값 확인(FUSE 로그)이 가른다
+            log(f"  !! 템플릿 {desc} 를 모든 클라이언트가 받지 못했다({versions()}) — 실제 값으로 확인한다")
     for _ in range(12):                       # FUSE 로그에 새 설정이 찍힐 때까지 조금 걸릴 수 있다
         eff = effective()
         if hit(eff):
