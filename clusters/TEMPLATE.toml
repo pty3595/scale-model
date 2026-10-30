@@ -22,6 +22,7 @@ admin_host = ""               # admin_cli 를 돌릴 노드(ssh_user 로 접속�
 fuse_log = ""                 # FUSE 가 설정을 찍는 로그 — 설정이 실제로 걸렸는지 여기서 본다
 fuse_service = ""             # FUSE systemd 서비스(fuse_restart 를 허락할 때만 쓴다)
 fuse_template = ""            # 지금 mgmtd 의 FUSE 템플릿 사본(discover 가 받아 둔다). 실험이 끝나면 이것으로 되돌린다
+# fuse_hot_update = false     # (선택) FUSE 가 템플릿 hot update 를 받지 않는 빌드면 — 모든 FUSE 설정을 FUSE 다시 띄우기로 건다
 # (선택) raw_hf3fs 만 — FUSE 없이 붙을 곳. FUSE launcher 설정(hf3fs_fuse_main_launcher.toml)의 값
 # mgmtd = "RDMA://<ip>:8000"   # mgmtd_server_addresses
 # cluster_id = ""             # cluster_id
@@ -31,8 +32,9 @@ fuse_template = ""            # 지금 mgmtd 의 FUSE 템플릿 사본(discover 
 [allow]
 fuse_template = false         # admin_cli set-config --type FUSE (클라이언트 읽기 · 연결 설정, 되돌린다)
 storage_hot_update = false    # admin_cli hot-update-config -t STORAGE (request-to-send · RDMA 동시 수 · coroutine, 되돌린다)
-fuse_restart = false          # FUSE 다시 띄우기(쓰기 admission · 쓰기 묶음). 사람이 있을 때만
+fuse_restart = false          # FUSE 다시 띄우기(쓰기 admission · 쓰기 묶음 등 CONFIG_ITEM). 켜면 설정을 바꿀 때 도구가 우리 클라이언트의 FUSE 를 다시 띄운다 — 그 마운트를 쓰는 다른 사용자도 잠깐 끊긴다
 throttle = false              # throttle.sh(PoC 에서 비율을 맞추던 것). 보통 필요 없다
+other_fuse = false            # [[client]] 밖의 FUSE 클라이언트가 붙어 있어도 템플릿을 바꾼다(그쪽에도 걸린다). false 면 멈춘다
 
 # 되돌릴 storage hot-update 값 — discover 가 지금 값을 읽어 채운다
 [home]

@@ -46,11 +46,16 @@ AD = ["hf3fs", "nixl_store_dynamic", "nixl_native"]   # 잴 adapter 와 순서 �
 # 3 knob search: 마지막 거르기의 위 둘(REF 포함)만 search → adapter 마다 가장 좋은 knob
 # 4 클러스터 설정: 가장 빠른 adapter · knob 에서만. 허락된 설정을 그 최대 위 한 칸에서 거르고, base 보다 여유가 큰 위 하나를 search
 # 5 경계 확인: 가장 좋은 조합의 최대 배속과 그 위 한 칸을 두 번씩 더(세 번 중 두 번으로 경계를 정한다)
+# 6 baseline: adapter 마다 문서 예시 knob 을 3FS 소스 기본값(src-w32, 쓰기 재시작 허락이 없으면 src)에서 search — "최적이 baseline 보다 얼마나" 의 분모
 # 거르기 검증(10-29, Spark 의 옛 search 결과 7 상황 · 30 경우): 한 번 잰 여유의 1등이 search 1등과 같다 26, 위 둘 안에 든다 28.
 #   틀린 것은 최대 배속 한 칸(13-20%) 차이다 — 같은 설정을 같은 배속에서 다시 재도 store 비율이 0.84-0.96 으로 흔들리는 폭이다.
 #   모두 통과하는 낮은 배속에서는 여유가 store 비율 상한(1/0.95)에 붙어 줄을 못 세운다 → 기준의 최대 위에서 거른다
 REF = {"hf3fs": "s16-d16", "nixl_store_dynamic": "dram_zc", "nixl_native": "w4"}   # 거르기 배속을 정할 출발점(Spark 에서 가장 좋았던 것). 후보는 knob 전부
-SETS = ["b1m", "r32-1m", "r6", "rts", "c512k"]          # 클러스터 설정 후보 — FUSE 재시작이 필요한 쓰기 설정(w32 · src-w32)은 뺀다
+SETS = ["b1m", "r32-1m", "r6", "rts", "c512k", "w32"]   # 클러스터 설정 후보. 허락이 없는 것은 allowed_setting 이 뺀다(w32 는 FUSE 다시 띄우기)
+STORE_WALL_SETS = ["c4m"]                               # 가장 좋은 조합이 위 한 칸에서 store 로 막히면 더한다(B300 10-30: chunk 4 MiB 가 store 를 올렸다, 버림은 크게 는다)
+BASELINE = {"hf3fs": "doc", "nixl_store_dynamic": "auto", "nixl_native": "w4"}   # 문서 예시 knob. nixl_native.rst 는 worker 4 · mem_config 없음(auto)인데,
+#   L1 이 2 GiB 를 넘으면 auto 의 dram_zc 등록이 2 GiB 버그로 실패해 dram 으로 돈다 = w4
+BASE_SETS = ("src-w32", "src")                           # baseline 의 클러스터 설정 — 허락되는 첫 것
 DEFAULT = ("coder", "qwen3-14b")
 SITUATION = T.OUT / "agent-situation"                     # 사용자가 정한 trace · 모델 — plan --trace --model 로 정하면 next · report 가 쓴다
 SEARCH_H = (0.25, 0.75)                                   # search 하나의 시간(어림, Spark: 최대 x1 위면 15-25분, x0.5 아래면 1시간 가까이)
@@ -100,8 +105,9 @@ def search_done(res, tag):
 
 
 def allowed_setting(name):
-    c = {**S.BASE, **{k: v for k, v in T.SETTINGS[name].items() if k != "chunk"}}
+    c = {**S.BASE, **{k: v for k, v in T.SETTINGS[name].items() if k not in T.LAYOUT_KEYS}}
     return not ((not C.allowed("fuse_template") and any(c[k] != S.HOME[k] for k in S.FUSE_KEYS))
+                or (not C.allowed("fuse_restart") and any(c[k] != S.HOME[k] for k in S.RESTART_KEYS))
                 or (not C.allowed("storage_hot_update") and any(c[k] != S.HOME[k] for k in S.ST_KEYS)))
 
 
@@ -172,6 +178,26 @@ def finalists(res, a, L):
 def steps():
     """계획의 단계: (이름, adapter, trace, model, tune.py 인자 | None(앞 단계를 기다림), 끝났나, 설명, 남은 search 수, 남은 실행 수)"""
     tr, mo = situation()
+    return tuned(tr, mo) + baseline(tr, mo)
+
+
+def baseline(tr, mo):
+    """6 baseline: adapter 마다 문서 예시 knob x 3FS 소스 기본값의 search. 그 adapter 의 기준 knob 최대(L)에서 출발한다"""
+    bs = next((x for x in BASE_SETS if allowed_setting(x)), None)
+    out = []
+    for a in [x for x in AD if x in BASELINE] if bs else []:
+        res, tag = results(a, tr, mo), f"{BASELINE[a]}+{bs}"
+        ref = f"{REF[a]}+base"
+        done = search_done(res, tag)
+        args = ([a, "--knobs", BASELINE[a], "--trace", tr, "--model", mo, "--settings", bs, "--settings-only",
+                 "--start", f"{best_speed(res, ref) or T.START:g}"]
+                if search_done(res, ref) else None)
+        out.append(("6 baseline", a, tr, mo, args, done, tag if args else "1 단계를 기다린다", 0 if done else 1, 0))
+    return out
+
+
+def tuned(tr, mo):
+    """1-5 단계"""
     out, bk, lk = [], {}, {}
     w = lambda *x: [x[0], "--knobs", x[1], "--trace", tr, "--model", mo, "--settings", x[2]] + list(x[3:])
     for a in AD:                                         # 1 기준 knob
@@ -219,6 +245,9 @@ def steps():
     res, tag = results(wa, tr, mo), bk[wa]
     k, b = tag.split("+")[0], best_speed(res, tag)
     combo = tag
+    up = at(res, tag, up_of(b)) if b and up_of(b) else None
+    if up and (up.get("store_ratio") or 1) < T.A.STORE_MIN and not T.ADAPTERS[wa].get("layout"):
+        sets = sets + [x for x in STORE_WALL_SETS if x not in sets and allowed_setting(x)]
     if sets:
         sp = up_of(b)
         got = {x: at(res, f"{k}+{x}", sp) for x in sets}
@@ -390,7 +419,7 @@ def opt(args, name):
     return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else None
 
 
-def launch(args, what):
+def launch(args, what, tries=1):
     if not check():
         raise SystemExit(1)
     a, tr, mo = args[0], opt(args, "--trace"), opt(args, "--model")
@@ -400,7 +429,7 @@ def launch(args, what):
         p = subprocess.Popen([sys.executable, "tune/tune.py", "sweep", *args], cwd=SM, stdout=lf, stderr=subprocess.STDOUT,
                              stdin=subprocess.DEVNULL, start_new_session=True)
     STATE.write_text(json.dumps({"pid": p.pid, "log": str(log), "args": args, "what": what, "started": time.strftime("%m-%d %H:%M"),
-                                 "runs": n_runs(a, tr, mo)},
+                                 "runs": n_runs(a, tr, mo), "tries": tries},
                                 ensure_ascii=False))
     print(f"띄웠다: {what}\n  pid {p.pid}, 로그 {log.relative_to(SM)}\n  tune.py sweep {' '.join(args)}")
     print("10-20분마다 `python3 tune/agent.py status` 로 본다. 끝나면(→ 끝났다) `agent.py next` 로 다음 단계를 띄운다")
@@ -413,7 +442,10 @@ def next_step():
             if args is None:
                 raise SystemExit(f"{name} {a} 는 앞 단계를 기다린다 — agent.py plan 출력을 사용자에게 보고한다")
             if last.get("args") == args and not alive(last["pid"]) and last.get("runs") == n_runs(a, tr, mo):   # 같은 단계를 띄웠는데 실행이 늘지 않았다
-                raise SystemExit(f"{name} {a} 를 다시 띄워도 진행이 없다(앞 실행 로그 {last['log']}) — agent.py plan · status 출력을 사용자에게 보고하고 기다린다")
+                if last.get("tries", 1) >= 2:        # 한 번은 일시적인 크래시일 수 있어 다시 띄운다. 두 번째도 같으면 같은 까닭으로 끝없이 돌 수 있다
+                    raise SystemExit(f"{name} {a} 를 다시 띄워도 진행이 없다(앞 실행 로그 {last['log']}) — agent.py plan · status 출력을 사용자에게 보고하고 기다린다")
+                print(f"앞 실행이 새 실행 없이 끝났다(로그 {last['log']}) — 한 번만 다시 띄운다")
+                return launch(args, f"{name} · {a} · {tr} x {mo} · {note} (다시)", last.get("tries", 1) + 1)
             return launch(args, f"{name} · {a} · {tr} x {mo} · {note}")
     print("계획이 다 끝났다 — `python3 tune/agent.py report` 로 보고한다")
 
@@ -513,6 +545,22 @@ def cell(res, tag):
     return s + (f", 무효 {inval}" if inval else "")
 
 
+def drops_vs_base(a, tr, mo, tag):
+    """layout(chunk · stripe)을 바꾼 설정이면 같은 배속에서 base 대비 storage 수신 버림 배수 — "x2.3 에서 base 의 12배". 아니면 빈 글"""
+    k, name = tag.split(".r")[0].split("+")
+    if not any(T.SETTINGS.get(name, {}).get(x) for x in T.LAYOUT_KEYS):
+        return ""
+    res = results(a, tr, mo)
+    for sp in sorted(set(speeds(res, f"{k}+{name}", False)) & set(speeds(res, f"{k}+base", False)), reverse=True):
+        runs = [folder(a, tr, mo) / "runs" / f"{t}-x{sp:g}" for t in (f"{k}+{name}", f"{k}+base")]
+        if all((r / "summary.json").exists() for r in runs):
+            d = [T.A.metrics(r).get("storage_rx_discards") for r in runs]
+            if d[0] is not None and d[1]:
+                r = d[0] / d[1]
+                return f"x{sp:g} 에서 버림 base 의 {r:.2f}배" if r < 1 else f"x{sp:g} 에서 버림 base 의 {r:.1f}배"
+    return ""
+
+
 def coverage(trace, model):
     total = done = 0
     print(f"== {trace} x {model}  (search = adapter · knob · 클러스터 설정 하나의 최대 배속)")
@@ -524,7 +572,7 @@ def coverage(trace, model):
             total, done = total + 1, done + bool(speeds(res, f"{k}+base"))
             print(f"   {k + '+base':26} {c or '-  안 잼'}")
         for t in sorted({t.split(".r")[0] for t in res if not t.split(".r")[0].endswith("+base")}):
-            print(f"   {t:26} {cell(res, t)}")
+            print(f"   {t:26} {cell(res, t)}" + (f"  ({x})" if (x := drops_vs_base(a, trace, model, t)) else ""))
     print(f"→ base 에서 잰 knob(거르기 · search) {done}/{total}" + (" — 다 쟀다" if done == total else " — 안 잰 것이 있다. '다 했다'고 하지 않는다"))
 
 
@@ -539,32 +587,37 @@ def report():
                else " / 하드웨어 계산 없음"))
     out = [f"## {time.strftime('%Y-%m-%d')} {C.NAME} 측정 결과", "",
            f"계획 단계 {len(st) - len(left)}/{len(st)} 끝" + (" — 계획이 다 끝났다" if not left else f" — 남은 단계 {len(left)}개(agent.py plan). 다 끝났다고 쓰지 않는다"),
-           f"클러스터 설정 허락: FUSE 템플릿 {C.allowed('fuse_template')} · storage hot-update {C.allowed('storage_hot_update')}", ceil, ""]
+           f"클러스터 설정 허락: FUSE 템플릿 {C.allowed('fuse_template')} · FUSE 다시 띄우기 {C.allowed('fuse_restart')} · storage hot-update {C.allowed('storage_hot_update')}", ceil,
+           "(자동) 표 · 위 줄 · 클러스터 줄은 도구가 채운다. (수동) 맨 아래 '추정' · '무효 · 멈춘 실행' 두 줄은 에이전트가 채운다", ""]
+    bs = next((x for x in BASE_SETS if allowed_setting(x)), None)
     for tr, mo in [situation()]:
         rows = []
         for a in AD:
             res = results(a, tr, mo)
             tags = sorted({t.split(".r")[0] for t in res}, key=lambda t: -(best_speed(res, t) or 0))
             tags = [t for t in tags if search_done(res, t)]
+            base_c = (cell(res, f"{BASELINE[a]}+{bs}") or "안 잼") if bs else "허락 없음"
             if not tags:
-                rows.append(f"| {a} | - | 안 잼 | | | | |")
+                rows.append(f"| {a} | - | 안 잼 | | | | | {base_c} |")
                 continue
             t = tags[0]
             b = best_speed(res, t)
             if b is None:
-                rows.append(f"| {a} | {t} | {cell(res, t)} | | | | |")
+                rows.append(f"| {a} | {t} | {cell(res, t)} | | | | | {base_c} |")
                 continue
             m = next(x for x in speeds(res, t)[b] if ok(x))
             f3 = lambda x: "-" if x is None else f"{x:.2f}"
             run = folder(a, tr, mo) / "runs" / f"{t}-x{b:g}"
             drops = T.A.metrics(run).get("storage_rx_discards") if (run / "summary.json").exists() else None
             rows.append(f"| {a} | {t} | {cell(res, t)} | {f3(m.get('load'))} · {f3(m.get('store'))} | "
-                        f"{f3(m.get('of_3fs_load'))} · {f3(m.get('of_3fs_store'))} | {'-' if drops is None else f'{drops:,}'} | "
-                        f"{sum(1 for k in T.ADAPTERS[a]['knobs'] if speeds(res, f'{k}+base'))}/{len(T.ADAPTERS[a]['knobs'])} |")
+                        f"{f3(m.get('of_3fs_load'))} · {f3(m.get('of_3fs_store'))} | {'-' if drops is None else f'{drops:,}'}"
+                        + (f" ({x})" if (x := drops_vs_base(a, tr, mo, t)) else "") + " | "
+                        f"{sum(1 for k in T.ADAPTERS[a]['knobs'] if speeds(res, f'{k}+base'))}/{len(T.ADAPTERS[a]['knobs'])} | {base_c} |")
         out += [f"### {tr} x {mo}", "",
-                "| adapter | 가장 좋은 knob+설정 | 최대 배속 통과/횟수 · 위 한 칸 통과/횟수 막힌 쪽 | 최대에서 load · store GiB/s | 3FS 천장 대비 load · store | storage 수신 버림 | 잰 knob(거르기 포함) |",
-                "|---|---|---|---|---|---|---|"] + rows + [""]
-    out += ["- 추정: (에이전트가 채운다. 없으면 \"없음\")", "- 무효 · 멈춘 실행: (에이전트가 채운다. 없으면 \"없음\")",
+                "| adapter | 가장 좋은 knob+설정 | 최대 배속 통과/횟수 · 위 한 칸 통과/횟수 막힌 쪽 | 최대에서 load · store GiB/s | 3FS 천장 대비 load · store | storage 수신 버림 | 잰 knob(거르기 포함) | "
+                f"baseline({'문서 예시 knob + ' + bs if bs else '-'}) |",
+                "|---|---|---|---|---|---|---|---|"] + rows + [""]
+    out += ["- 추정: (수동 — 에이전트가 채운다. 없으면 \"없음\")", "- 무효 · 멈춘 실행: (수동 — 에이전트가 채운다. 없으면 \"없음\")",
             "- 클러스터: " + ("; ".join(S.check_home()) or "HOME 과 같다") if not sweeps() else "- 클러스터: 측정이 도는 중"]
     text = "\n".join(out)
     f = T.OUT / f"report-{time.strftime('%m%d-%H%M')}.md"

@@ -7,7 +7,8 @@
 FUSE 는 클라이언트마다 mgmtd 설정 버전이 올라갔는지와 FUSE 로그에 찍힌 값으로, storage 는 노드마다 get-config 로 확인한다.
 HOME(되돌릴 곳) = 그 클러스터의 FUSE 템플릿 사본의 값 + [home]. BASE(실험 기준) = [ref]. 템플릿은 되돌릴 곳일 뿐 실험의 기준이 아니다(10-21 사용자).
 허락([allow])이 없는 쪽은 기준도 지금 값(HOME)으로 두고, 그 쪽을 바꾸는 후보는 NotAllowed 로 건너뛴다.
-쓰기 둘은 CONFIG_ITEM 이라 FUSE 를 다시 띄워야 바뀐다. 다시 띄운 동안은 FUSE_WRITE · FUSE_WBATCH 로 지금 값을 알려 준다(fuse_write.py).
+쓰기 둘은 CONFIG_ITEM 이라 FUSE 를 다시 띄워야 바뀐다(RESTART_KEYS). [allow] fuse_restart 면 apply 가 템플릿을 올린 뒤 다시 띄우고, 되돌릴 때도 그렇게 한다.
+손으로 다시 띄워 둔 동안은 FUSE_WRITE · FUSE_WBATCH 로 지금 값을 알려 준다(fuse_write.py).
 
     settings.py state      지금 FUSE(클라이언트마다) · storage(노드마다) 값
     settings.py restore    HOME 으로 되돌리고 확인
@@ -22,6 +23,7 @@ from pathlib import Path
 SM = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SM))
 import cluster as C           # noqa: E402
+from guard import busy        # noqa: E402
 
 TMP = SM / "results/tune"
 # 설정 이름 → 템플릿의 (절, 키). a/b 값은 키 둘에 나눠 건다
@@ -38,6 +40,8 @@ FUSE = {
 FUSE_KEYS = tuple(FUSE)
 QUOTED = ("batch", "wbatch", "tsel")
 ST_KEYS = ("rts", "coro")
+# 템플릿을 올려도 FUSE 를 다시 띄워야 바뀌는 것(CONFIG_ITEM). hot update 를 받지 않는 빌드는 [threefs] fuse_hot_update = false 로 모두
+RESTART_KEYS = ("write", "wbatch") if C.C["threefs"].get("fuse_hot_update", True) else FUSE_KEYS
 
 
 class NotAllowed(Exception):
@@ -93,11 +97,14 @@ def versions():
         f = l.split()
         if len(f) > 8:
             if f[8] in C.CLIENT_SET:
-                v[f[8]] = int(f[7])
+                v[f[8]] = int(re.match(r"\d+", f[7]).group())     # 빌드에 따라 "0(uptodate)" 처럼 상태가 붙는다
             elif not (f[8] == "N/A" and f[0].rsplit("_", 2)[0] in C.CLIENT_SET):
                 others.append(f[8])     # 우리 raw_hf3fs connector(ClientId 호스트_pid_n, 호스트 N/A)는 FUSE 가 아니라 템플릿을 받지 않는다
     if others:
-        raise SystemExit(f"우리 목록 밖의 FUSE 클라이언트가 있다({', '.join(sorted(set(others)))}) — FUSE 템플릿을 바꾸면 그쪽에도 걸린다")
+        msg = f"우리 목록 밖의 FUSE 클라이언트가 있다({', '.join(sorted(set(others)))}) — FUSE 템플릿을 바꾸면 그쪽에도 걸린다"
+        if not C.allowed("other_fuse"):
+            raise SystemExit(msg + " ([allow] other_fuse 로 클러스터 주인이 허락하면 경고만 하고 잇는다)")
+        log(f"  !! {msg} — [allow] other_fuse 라 잇는다")
     return v
 
 
@@ -120,15 +127,17 @@ def make_tpl(c, out):
 
 
 def effective():
-    """클라이언트마다 FUSE 로그에 마지막으로 찍힌 값(절, 키) → 글자. 설정 덤프는 스레드마다 따로 찍혀 스레드별로 절을 따라간다"""
+    """클라이언트마다 FUSE 로그에 마지막으로 찍힌 값(절, 키) → 글자. 설정 덤프는 스레드마다 따로 찍혀 스레드별로 절을 따라간다.
+    덤프는 빌드에 따라 ConfigManager.cc INFO(Spark) 또는 ApplicationBase.cc · WARNING 줄로 찍힌다"""
     keys = " ".join(f"{s}/{k}" for places in FUSE.values() for s, k in places)
+    dump = "(ConfigManager|ApplicationBase)\\.cc:[0-9]+ (INFO|WARNING)\\] "
     awk = ("awk -v want='" + keys + "' 'BEGIN {n = split(want, w, \" \"); for (i = 1; i <= n; i++) W[w[i]] = 1} "
-           "/ConfigManager.cc:[0-9]+ INFO\\] / {th = $2; sub(/.*ConfigManager.cc:[0-9]+ INFO\\] /, \"\"); "
+           f"/{dump}/ {{th = $2; sub(/.*{dump}/, \"\"); "
            "if ($0 ~ /^\\[.*\\]$/) {sec[th] = substr($0, 2, length($0) - 2); next} "
            "split($0, a, \" = \"); k = sec[th] \"/\" a[1]; if (k in W) v[k] = a[2]} END {for (k in v) print k \" = \" v[k]}'")
     out = {}
     for c in C.CLIENTS:
-        txt = C.sudo_sh(C.addr(c["host"]), f"grep -E 'ConfigManager.cc:[0-9]+ INFO\\]' {C.C['threefs']['fuse_log']} | {awk}")
+        txt = C.sudo_sh(C.addr(c["host"]), f"grep -E '{dump}' {C.C['threefs']['fuse_log']} | {awk}")
         out[c["host"]] = {tuple(l.split(" = ")[0].split("/")): l.split(" = ", 1)[1] for l in txt.splitlines() if " = " in l}
     return out
 
@@ -156,12 +165,36 @@ def push_fuse(c):
         # 맞는지는 아래의 실제 값 확인(FUSE 로그)이 가른다
         log(f"  !! 템플릿 {desc} 를 모든 클라이언트가 받지 못했다({versions()}) — 실제 값으로 확인한다")
     want = literals(c)
+    hit = lambda eff: all(all(e.get(p) == v for p, v in want.items()) for e in eff.values())
+    eff = effective()
+    restart = [p for k in RESTART_KEYS for p in FUSE[k] if any(e.get(p) != want[p] for e in eff.values())]
+    if restart:                               # 템플릿만으로는 안 바뀐다 — 기다리지 않고 다시 띄운다
+        log(f"  FUSE 를 다시 띄워야 바뀐다: {', '.join('/'.join(p) for p in restart)}")
+        restart_fuse()
     for _ in range(12):                       # FUSE 로그에 새 설정이 찍힐 때까지 조금 걸릴 수 있다
         eff = effective()
-        if all(all(e.get(p) == v for p, v in want.items()) for e in eff.values()):
+        if hit(eff):
             return show_fuse(eff)
         time.sleep(5)
     raise RuntimeError("FUSE 설정이 모든 클라이언트에 걸리지 않았다:\n" + show_fuse(eff))
+
+
+def restart_fuse():
+    """우리 클라이언트의 FUSE 를 다시 띄우고 마운트가 돌아올 때까지 본다. 그 노드의 마운트를 쓰는 다른 사용자도 잠깐 끊긴다"""
+    if not C.allowed("fuse_restart"):
+        raise NotAllowed("FUSE 다시 띄우기")
+    why = busy()
+    if why:
+        raise RuntimeError("다른 작업이 보여 FUSE 를 다시 띄우지 않는다: " + "; ".join(why))
+    for cl in C.CLIENTS:
+        C.sudo_sh(C.addr(cl["host"]), f"systemctl restart {C.C['threefs']['fuse_service']}")
+    for _ in range(24):
+        time.sleep(5)
+        m = {cl["host"]: C.sh(C.addr(cl["host"]), f"timeout 10 ls {C.MOUNT} > /dev/null && echo ok", check=False).strip() for cl in C.CLIENTS}
+        if all(v == "ok" for v in m.values()):
+            log("  FUSE 다시 띄움 — 마운트가 모두 돌아왔다")
+            return
+    raise RuntimeError(f"FUSE 를 다시 띄운 뒤 마운트가 돌아오지 않았다: {m}")
 
 
 # --- storage ---
@@ -234,6 +267,8 @@ def apply(c, force=False):
     fuse = st = None
     if not C.allowed("fuse_template") and any(c[k] != HOME[k] for k in FUSE_KEYS):
         raise NotAllowed("FUSE 템플릿")
+    if not C.allowed("fuse_restart") and any(c[k] != HOME[k] for k in RESTART_KEYS):
+        raise NotAllowed("FUSE 다시 띄우기")
     if not C.allowed("storage_hot_update") and any(c[k] != HOME[k] for k in ST_KEYS):
         raise NotAllowed("storage hot-update")
     if C.allowed("fuse_template") and (first or any(c[k] != CUR[k] for k in FUSE_KEYS)):

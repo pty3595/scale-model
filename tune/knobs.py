@@ -40,7 +40,8 @@ KNOBS = [
       when="replay 에서는 버퍼 시작 주소와 adapter 에 넘기는 align_bytes 만 바뀐다(key 는 정렬 없이 이어 붙인다). "
            "L1 을 그대로 NIXL 에 등록하는 dram_zc 에서만 움직인다 — hf3fs(복사) · nixl_native(dram)는 같다. key 크기가 정렬의 배수가 아니면 NIXL 등록이 깨진다(17 MiB key 에 8 MiB)",
       cost="dram_zc 에서 8 MiB · 2 MiB 가 4 KiB 보다 한 단계 낫다(2 MiB 면 충분 — huge page 경계로 본다). 정렬은 key 크기를 나눠야 한다 — 아니면 adapter 가 안 뜬다"
-           "(DeepSeek-V3 17,989,632 B = 32 KiB x 549 → 2 MiB · 8 MiB 모두 NIXL_ERR_NOT_FOUND). 빠른 길은 key 가 2 MiB 배수인 모델만"),
+           "(DeepSeek-V3 17,989,632 B = 32 KiB x 549 → 2 MiB · 8 MiB 모두 NIXL_ERR_NOT_FOUND). 빠른 길은 key 가 2 MiB 배수인 모델만. "
+           "B300(10-30)에서는 정렬 효과가 0 이었다 — 클러스터마다 다르다"),
     K("l1-size", "LMCache MP 서버", "--l1-size-gb, vLLM GPU KV", "L1 · GPU KV 크기", "상황 입력",
       ("대상 서버 값", "—"), "fixed", ours="L1 32 · GPU KV 24 GiB(Spark 한 대에 맞춘 가정)",
       why="최적화할 값이 아니다. L1 크기 하나로 load 양이 두 배 넘게 바뀐다 — L1 8 · 32 · 128 GiB 에 load 3.25 · 2.52 · 1.50 GiB/s, store 1.71 그대로(시뮬레이터, coder 30-33분 1배속 세 대 합)"),
@@ -50,7 +51,8 @@ KNOBS = [
     K("prefetch", "LMCache MP 서버", "--l2-prefetch-max-in-flight", "load 를 몇 request 겹치나", "MP 서버 flag (replay 는 --slots)",
       ("8", "LMCache distributed/config.py"), "sweep",
       cands=[("s16-d16-sl4", "4 (폴더 16)"), ("s16-d16-sl16", "16 (폴더 16)"), ("s16-d1-sl4", "4 (폴더 1, Llama)"), ("s16-d1-sl16", "16 (폴더 1, Llama)")],
-      when="load 를 몇 request 겹치나 — 읽기 동시성을 LMCache 쪽에서 바꾼다. replay 의 --slots"),
+      when="load 를 몇 request 겹치나 — 읽기 동시성을 LMCache 쪽에서 바꾼다. replay 의 --slots",
+      why="B300(10-30): 효과 0"),
     K("eviction", "LMCache MP 서버", "--eviction-policy · --eviction-trigger-watermark · --eviction-ratio", "L1 을 언제 얼마나 비우나", "MP 서버 flag",
       ("LRU(필수 인자) · 0.8 · 0.2", "LMCache distributed/config.py, targets/serving-base.json"), "sweep",
       when="IO 경로가 아니라 IO 양(plan)을 바꾼다 — 도구는 `tune.py --evict 문턱/비율` 로 plan 을 시뮬레이터로 다시 낸다. 단계가 아니라 배속으로 견준다. "
@@ -90,14 +92,18 @@ KNOBS = [
       ("auto", "LMCache nixl.rst 예시는 mem_config 를 주지 않는다 = plugin 기본"), "sweep", ours="dram_zc",
       cands=[("auto", "auto"), ("dram", "dram"), ("dram_zc", "dram_zc")],
       when="auto 는 이 클러스터에서 dram 으로 내려앉는다(로그 hf3fs_backend.cpp:588). 복사가 없으면 클라이언트 한 대 벽이 3.06 → 5.37 GiB/s(09-23)",
-      cost="dram_zc 는 2 GiB 넘는 버퍼 등록이 짧은 pwrite 로 실패하는 plugin 버그가 있다 — /tmp/pwrite_full.so 를 LD_PRELOAD(세 대 /tmp, 재부팅하면 사라짐)"),
+      cost="dram_zc 는 2 GiB 넘는 버퍼 등록이 짧은 pwrite 로 실패하는 plugin 버그가 있다 — /tmp/pwrite_full.so 를 LD_PRELOAD(세 대 /tmp, 재부팅하면 사라짐). "
+           "nixl_store_dynamic 은 L1 을 agent 하나로 한 번만 등록해 worker 수와 상관없이 데이터가 맞다(코드, dynamic_nixl_store_agent.py) — /dev/shm 에 L1 한 벌이 든다"),
     K("native-workers", "adapter NIXL", "num_workers (nixl_native)", "IO worker 수", "adapter JSON",
       ("4", "nixl_native_l2_adapter.py 기본 · 문서 예시"), "sweep", cands=[("w4", "4"), ("w16", "16")]),
     K("native-mem-config", "adapter NIXL", "backend_params.mem_config (nixl_native)", "dram = IO 마다 복사, dram_zc = L1 을 그대로 등록", "adapter backend param",
-      ("auto", "LMCache nixl_native.rst 예시는 mem_config 를 주지 않는다 = plugin 기본"), "out", ours="dram",
-      cands=[("w16", "dram"), ("w16-zc", "dram_zc (8 MiB 정렬)"), ("w16-zc-a4k", "dram_zc (4 KiB 정렬)")],
-      when="nixl_store_dynamic 에서 dram → dram_zc 가 두 단계 넘게 올렸다", cost="dynamic 과 같은 2 GiB 버그 shim 이 필요하다",
-      why="dram_zc 는 세 모델 모두 L1 등록에서 실패한다(NIXL_ERR_BACKEND, hf3fs_backend.cpp:588 No space left on device — /dev/shm 57 GB 여유에서도, shim 을 걸어도). 까닭은 가르지 않았다"),
+      ("auto", "LMCache nixl_native.rst 예시는 mem_config 를 주지 않는다 = plugin 기본"), "sweep", ours="dram",
+      cands=[("w4", "dram (기준)"), ("w1-zc", "dram_zc, worker 1")],
+      when="nixl_store_dynamic 에서 dram → dram_zc 가 두 단계 넘게 올렸다",
+      cost="dynamic 과 같은 2 GiB 버그 shim 이 필요하다. /dev/shm 에 L1 x worker 수가 든다(도구가 실행 전에 본다)",
+      why="worker 마다 NIXL agent 가 같은 L1 을 따로 등록하며 L1 자리를 자기 /dev/shm 사본으로 바꿔 끼워, worker 가 둘 이상이면 데이터가 조용히 망가진다 "
+          "(09-29 측정: key 16개 중 worker 2 는 8개 · 4 는 15개 다름, load 는 2.4배 빨라 보였다). 그래서 dram_zc 는 worker 1개로만 knob 으로 둔다(tune.py native() 가 막는다). "
+          "Spark 에서 w16 dram_zc 는 /dev/shm 이 모자라 뜨지 않았다(16 x 32 GiB). B300(10-30)의 w16 dram_zc 2.3배는 위 손상과 같은 모양이다 — 데이터를 확인하기 전에는 쓰지 않는다"),
     K("direct-io", "adapter NIXL", "backend_params.use_direct_io", "O_DIRECT 로 열기", "adapter backend param",
       ("필수 인자", "file_dynamic_nixl_store_agent.py"), "sweep", ours="true",
       cands=[("dram_zc-nodio", "false (nixl_store_dynamic dram_zc)"), ("w16-nodio", "false (nixl_native)")]),
@@ -143,7 +149,7 @@ KNOBS = [
       when="클라이언트 하나가 내는 USRBIO 처리량이 커서(망 손실 · 링크가 먼저 막지 않을 때) 이 스레드 둘의 CPU 가 먼저 찰 때",
       cost="CONFIG_ITEM 이라 FUSE 를 다시 띄워야 한다 — 그 노드의 마운트를 쓰는 다른 사용자도 끊긴다([allow] fuse_restart)",
       why="B300(10-29): usrbio 쓰기에서 이 두 스레드가 꽉 찬다고 찾았다. Spark 는 망 손실 · 복제 2 가 먼저 막아 보이지 않았고, "
-          "쓰기 천장(대당 2.7 GiB/s)이 이 벽이었는지는 아직 재지 않았다(FUSE 스레드별 CPU 를 보며 fio-usrbio 쓰기)"),
+          "쓰기 천장(대당 2.7 GiB/s)이 이 벽이었는지는 아직 재지 않았다(FUSE 스레드별 CPU 를 보며 fio-usrbio 쓰기). 도구의 설정 후보에는 아직 없다(B300 10-30 미실행)"),
     K("read-target", "FUSE 읽기", "storage_io.read.targetSelection.mode", "복제 둘 중 어디서 읽나", "FUSE 템플릿, 바로 바뀜",
       ("Default = LoadBalance", "3FS TargetSelection.h · StorageClientImpl.cc"), "sweep",
       cands=[("ts-rr", "RoundRobin"), ("ts-rand", "RandomTarget"), ("ts-head", "HeadTarget"), ("rts-rand", "RandomTarget + request-to-send (겹침)")]),
@@ -159,14 +165,14 @@ KNOBS = [
       ("기본", "3FS StorageClient.h · net Client 설정"), "out", why="실패 처리와 진단용이라 처리량 경로가 아니다. 압축은 0(끔)이고 RDMA 데이터에는 걸리지 않는다"),
 
     # --- 3FS client (FUSE) 쓰기 ---
-    K("write-admission", "FUSE 쓰기", "storage.traffic_control.write.max_concurrent_requests · _per_server", "동시 쓰기 RPC", "FUSE 템플릿 + FUSE 재시작(CONFIG_ITEM, tune/fuse_write.py)",
+    K("write-admission", "FUSE 쓰기", "storage.traffic_control.write.max_concurrent_requests · _per_server", "동시 쓰기 RPC", "FUSE 템플릿 + FUSE 재시작(CONFIG_ITEM — [allow] fuse_restart 면 도구가 다시 띄운다)",
       ("32 / 8", "3FS StorageClient.h, upstream configs/hf3fs_fuse_main.toml"), "sweep",
       ours="64 / 32 — 템플릿 값(출처 기록 없음)이지만 10-22 측정으로 선다: 32/8 이면 store 가 약 4-5 GiB/s 에서 막힌다",
       cands=[("w32", "32 / 8 (소스 기본값)"), ("w128", "128 / 64")],
       when="store 의 동시 쓰기 수. 32/8 이면 store 가 약 4-5 GiB/s(64/32 는 6.5-7.2)에서 막혀 api(B) · chat(A) -1 넘게, coder x Qwen 두 단계 넘게 나쁘다. "
-           "버림(packet)은 1/20 로 준다 — 더 키우면(128/64) store 벽이 오를지가 다음 후보",
-      cost="바꾸려면 클라이언트 세 대 FUSE 를 다시 띄워야 한다 — 그동안 3FS 마운트를 쓰는 것이 없어야 한다"),
-    K("write-batch", "FUSE 쓰기", "storage.traffic_control.write.max_batch_bytes", "쓰기 RPC 하나에 담는 최대 바이트", "FUSE 템플릿 + FUSE 재시작(CONFIG_ITEM, StorageClient.h OperationConcurrency)",
+           "버림(packet)은 1/20 로 준다 — 더 키우면(128/64) store 벽이 오를지가 다음 후보. B300(10-30): 128/32 효과 없음",
+      cost="바꾸려면 클라이언트 FUSE 를 다시 띄워야 한다 — 그 마운트를 쓰는 다른 사용자도 잠깐 끊긴다"),
+    K("write-batch", "FUSE 쓰기", "storage.traffic_control.write.max_batch_bytes", "쓰기 RPC 하나에 담는 최대 바이트", "FUSE 템플릿 + FUSE 재시작(CONFIG_ITEM, StorageClient.h OperationConcurrency — [allow] fuse_restart 면 도구가 다시 띄운다)",
       ("4MB", "3FS StorageClient.h"), "sweep", cands=[("wb1m", "1MB")],
       when="10-23 목록에 없던 것을 찾았다. 읽기 묶음 1MB 가 읽기 몰림을 줄였듯 쓰기 몰림을 줄일 후보로 쟀다. "
            "api(B) 10-23 같은 때(앞뒤 기준 네 번 · 1MB 세 번): 0.25 통과 2/3 대 1/4, store 달성 0.95 대 0.94 · 0.30 은 모두 실패, 0.81 대 0.78 — 단계는 같고 연속 값만 조금 낫다(흔들림 안). "
@@ -217,10 +223,13 @@ KNOBS = [
     K("chunk", "layout", "chunk size (admin_cli set-layout)", "파일을 나누는 단위 = IO 하나 = RPC 에 담기는 최소 단위", "폴더마다",
       ("1 MiB", "3FS deploy/README.md init-cluster"), "sweep",
       cands=[("ch512k", "512 KiB"), ("c4m", "4 MiB"), ("c512k", "512 KiB · 읽기 32/8 · 묶음 512KB (세 값을 함께 바꿔 chunk 효과로 못 읽는다)")],
-      when="크면 IO 하나가 커져 한 번에 몰리는 양이 크고 key 하나가 쓰는 chain 이 준다. 작으면 읽기 손실이 줄지만 store 의 IO 수가 늘어 store 가 먼저 막힌다 (Qwen 512 KiB: 버림 1/7, store 7.0 → 약 5.6 GiB/s). store 쪽 손잡이와 겹쳐 볼 후보"),
+      when="크면 IO 하나가 커져 한 번에 몰리는 양이 크고 key 하나가 쓰는 chain 이 준다. 작으면 읽기 손실이 줄지만 store 의 IO 수가 늘어 store 가 먼저 막힌다 (Qwen 512 KiB: 버림 1/7, store 7.0 → 약 5.6 GiB/s). store 쪽 손잡이와 겹쳐 볼 후보. "
+           "가장 좋은 조합이 위 한 칸에서 store 로 막히면 계획이 c4m 을 클러스터 설정 후보에 더한다. chunk 를 바꾼 설정은 같은 배속 base 대비 버림 배수를 함께 낸다(coverage · report)",
+      why="B300(10-30): 4 MiB 가 store 를 올렸지만 storage NIC 수신 버림이 100배, c512k 는 -33%"),
     K("stripe", "layout", "stripe size (admin_cli set-layout)", "파일 하나가 퍼지는 chain 수", "폴더마다",
       ("16 (upstream 예시) · 이 클러스터 8 (chain 8개)", "3FS deploy/README.md init-cluster"), "sweep",
-      cands=[("stripe4", "4"), ("stripe1", "1"), ("stripe1-b1m", "1 · 묶음 1MB")]),
+      cands=[("stripe4", "4"), ("stripe1", "1"), ("stripe1-b1m", "1 · 묶음 1MB")],
+      why="SETTINGS 에 있어 agent.py start 로 잴 수 있다. 계획(SETS)에는 넣지 않았다 — 근거가 없다. B300(10-30) 미실행"),
 ]
 
 # 기준 상황 — 다시 돌리기로 확인한 기준 단계. 결과는 tune 폴더(ver+trace+model)와 screen 폴더(a 만)에서 끌어온다

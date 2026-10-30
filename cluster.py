@@ -25,7 +25,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 DIR = HERE / "clusters"
 ME = socket.gethostname()
-ACTIONS = ("fuse_template", "storage_hot_update", "fuse_restart", "throttle")
+ACTIONS = ("fuse_template", "storage_hot_update", "fuse_restart", "throttle", "other_fuse")
 
 
 def _pick():
@@ -151,7 +151,7 @@ def put_admin(local, remote):
 
 def allowed(action):
     assert action in ACTIONS, action
-    return bool(C["allow"][action])
+    return bool(C["allow"].get(action, False))     # 없는 키는 허락 안 함(나중에 생긴 항목)
 
 
 def require(action, what):
@@ -372,7 +372,7 @@ def discover(name):
          f"fuse_log = {found(me.get('log') or first.get('log'), f'/var/log/3fs-{cid}, 없으면 /var/log/3fs')}",
          f"fuse_service = {found(sp.get('svc'), svc_what)}",
          f"fuse_template = {q(str(fuse.relative_to(HERE)))}   # 지금 mgmtd 의 FUSE 템플릿(되돌릴 곳)", "",
-         "[allow]   # 클러스터 주인에게 묻고 채운다", "fuse_template = false", "storage_hot_update = false", "fuse_restart = false", "throttle = false", "",
+         "[allow]   # 클러스터 주인에게 묻고 채운다", "fuse_template = false", "storage_hot_update = false", "fuse_restart = false", "throttle = false", "other_fuse = false", "",
          "[home]   # 되돌릴 storage hot-update 값 — storage " + (str(stor[0][0]) if stor else "") + " 의 지금 값",
          f"rts = {q('on' if get('server.storage', 'rdma_transmission_req_timeout') not in ('', '0ns', '0ms') else 'off')}",
          f"coro = {q(get('server.coroutines_pool_update', 'coroutines_num') + '/' + get('server.coroutines_pool_update', 'threads_num'))}",

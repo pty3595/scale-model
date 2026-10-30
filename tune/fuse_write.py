@@ -9,7 +9,6 @@
 다른 사람의 서빙이 돌면 하지 않는다. 다시 띄운 뒤 마운트 · 쓰기 한도를 확인하고, 하나라도 다르면 실패로 끝낸다.
 """
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -26,31 +25,8 @@ def main():
     if why:
         raise SystemExit("다른 작업이 보여 하지 않는다: " + "; ".join(why))
     c = dict(S.HOME, write=want, wbatch=wbatch)
-    try:
-        S.push_fuse(c)                # 템플릿을 올린다. 쓰기는 재시작 전이라 확인이 실패한다
-    except RuntimeError:
-        pass
-    S.log(f"템플릿에 쓰기 {want} · 묶음 {wbatch} 을 올렸다 — 클라이언트 FUSE 를 다시 띄운다")
-    for cl in C.CLIENTS:
-        C.sudo_sh(C.addr(cl["host"]), f"systemctl restart {C.C['threefs']['fuse_service']}")
-        print(f"{cl['host']} 다시 띄움", flush=True)
-    for _ in range(24):               # 마운트가 돌아올 때까지
-        time.sleep(5)
-        m = {cl["host"]: C.sh(C.addr(cl["host"]), f"timeout 10 ls {C.MOUNT} > /dev/null && echo ok", check=False).strip() for cl in C.CLIENTS}
-        if all(v == "ok" for v in m.values()):
-            break
-    else:
-        raise SystemExit(f"마운트가 돌아오지 않았다: {m}")
-    lit = S.literals(c)
-    keys = [p for k in ("write", "wbatch") for p in S.FUSE[k]]
-    for _ in range(12):
-        eff = S.effective()
-        if all(all(e.get(p) == lit[p] for p in keys) for e in eff.values()):
-            break
-        time.sleep(5)
-    else:
-        raise SystemExit(f"쓰기 한도가 {want} · 묶음 {wbatch} 이 아니다:\n{S.show_fuse(eff)}")
-    S.log(f"마운트 ok · 쓰기 {want} · 묶음 {wbatch}\n    {S.show_fuse(eff)}")
+    S.log(f"템플릿에 쓰기 {want} · 묶음 {wbatch} 을 올리고 클라이언트 FUSE 를 다시 띄운다")
+    S.log(f"마운트 ok · 쓰기 {want} · 묶음 {wbatch}\n    {S.push_fuse(c)}")     # 다시 띄우고 실제 값까지 본다(settings.restart_fuse)
 
 
 if __name__ == "__main__":

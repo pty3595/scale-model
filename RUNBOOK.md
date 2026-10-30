@@ -32,7 +32,7 @@ trace · 모델은 서빙의 요구라 주어지는 것이고, adapter · knob �
 2. 따로 측정 스크립트 · 모니터를 만들지 않는다. 필요한 숫자(망 버림 · 재전송 포함)는 도구가 실행마다 이미 잰다("도구가 재는 것")
 3. 코드(`*.py` · `*.sh`)와 `calibration.json` 을 고치지 않는다. 도구가 에러로 멈추면 고치거나 우회하지 않고 "문제가 생기면"의 표대로 한다
 4. 클러스터 설정을 바꾸는 명령을 직접 치지 않는다 — `admin_cli set-config` · `hot-update-config` · `set-layout`, `systemctl restart`, FUSE 다시 띄우기(`tune/fuse_write.py` 도).
-   FUSE 쓰기 admission · 쓰기 묶음은 FUSE 를 다시 띄워야 바뀌고 그 노드의 다른 사용자 마운트도 끊겨서 계획에 넣지 않았다(`w32` · `src-w32`)
+   FUSE 쓰기 admission · 쓰기 묶음은 FUSE 를 다시 띄워야 바뀐다. 클러스터 주인이 `[allow] fuse_restart` 를 켠 클러스터에서만 도구가 다시 띄운다(그 노드의 다른 사용자 마운트도 잠깐 끊긴다). 꺼져 있으면 그 후보(`w32` · `src-w32`)는 계획에서 빠진다
 5. `clusters/<이름>.toml` 의 `[access]` · `[allow]` · `[home]` · `[ref]` 를 고치지 않는다. 비밀번호를 파일이나 대화에 적지 않는다(`[builds]` 는 "설치"대로 채운다)
 6. 3FS 에서 아무것도 지우지 않는다(`rm` 을 쓰지 않는다). 재생 폴더는 도구가 지운다
 7. 다른 사람이 클러스터를 쓰는 중이면 측정을 띄우지 않는다. 측정을 두 개 함께 돌리지 않는다
@@ -189,10 +189,11 @@ trace · 모델은 서빙의 요구라 주어지는 것이고, adapter · knob �
 | 1 기준 knob | adapter 마다 기준 knob 하나를 search 해 최대 배속 L 을 잰다 |
 | 2 knob 거르기 | 나머지 knob 을 L 위 한 칸에서 한 번씩 돌려 줄 세운다. 셋 이상 통과하면 통과한 것만 두 배 위에서 다시 |
 | 3 knob search | adapter 마다 거르기의 위 둘만 search 한다 |
-| 4 클러스터 설정 | 가장 빠른 adapter · knob 에서만 — 설정 다섯을 거르고 base 보다 나은 위 하나를 search(`[allow]` 가 없는 것은 도구가 뺀다) |
+| 4 클러스터 설정 | 가장 빠른 adapter · knob 에서만 — 설정 후보(`agent.py` 의 `SETS`)를 거르고 base 보다 나은 위 하나를 search. `[allow]` 가 없는 것은 도구가 뺀다. 가장 좋은 조합이 위 한 칸에서 store 로 막히면 chunk 4 MiB(`c4m`)를 후보에 더한다 |
 | 5 경계 확인 | 가장 좋은 조합의 최대 배속과 그 위 한 칸을 두 번씩 더 |
+| 6 baseline | adapter 마다 문서 예시 knob 을 3FS 소스 기본값(`src-w32`, FUSE 다시 띄우기 허락이 없으면 `src`)에서 search — "baseline 보다 얼마나"의 분모 |
 
-상황 하나에 search 7-10개와 한 번 실행 25-30개, 어림 2-10시간(보통 5시간 안팎)이다. adapter 가 느릴수록 길다 — x0.25 실행 하나가 15분이다. 사람이 끊지 않는 한 계획이 다 끝날 때까지 이어 간다. 계획을 줄이거나 단계를 건너뛰지 않는다 — 사용자가 adapter · knob 을 콕 집어 시키면 그때만 그것을 `agent.py start` 로 돈다(knob 목록은 `agent.py coverage`).
+상황 하나에 search 10-13개와 한 번 실행 25-30개, 어림 3-12시간(보통 6시간 안팎)이다. adapter 가 느릴수록 길다 — x0.25 실행 하나가 15분이다. 사람이 끊지 않는 한 계획이 다 끝날 때까지 이어 간다. 계획을 줄이거나 단계를 건너뛰지 않는다 — 사용자가 adapter · knob 을 콕 집어 시키면 그때만 그것을 `agent.py start` 로 돈다(knob 목록은 `agent.py coverage`).
 
 ### Spark 에서 못 본 knob
 
@@ -251,7 +252,7 @@ trace 파일은 `traces/`(Alibaba 공개 trace, Git LFS)에 있다. plan(재생�
 
 ## 결과 보고
 
-`python3 tune/agent.py report` 가 보고 표를 만든다(`results/tune-<규칙>/report-<시각>.md` 에도 쓴다). 그 출력을 고치지 않고 그대로 보내고, 맨 아래 두 줄만 채운다.
+`python3 tune/agent.py report` 가 보고 표를 만든다(`results/tune-<규칙>/report-<시각>.md` 에도 쓴다). 그 출력을 고치지 않고 그대로 보내고, 맨 아래 두 줄(표에 "(수동)" 으로 적힌 것)만 채운다. 나머지는 도구가 채운다.
 
 - `- 추정:` — 원인을 말하고 싶으면 여기에만, 짐작이라고 밝혀 쓴다. 없으면 "없음"
 - `- 무효 · 멈춘 실행:` — `status` · 로그에서 본 `!! 무효` · 멈춤의 tag 와 이유. 없으면 "없음"
@@ -268,6 +269,25 @@ trace 파일은 `traces/`(Alibaba 공개 trace, Git LFS)에 있다. plan(재생�
 
 knob 하나하나의 결과는 `python3 tune/agent.py coverage --trace <trace> --model <모델>` 이다.
 
+## 알려진 문제
+
+도구 밖(LMCache · NIXL · 3FS)의 결함과 도구가 그것을 피하는 법이다. 근거의 "코드"는 소스를 읽어 안 것, "측정"은 잰 것이다. 이 우회를 풀거나 피한 조합을 돌리지 않는다.
+
+| 문제 | 근거 | 도구는 |
+|---|---|---|
+| NIXL HF3FS plugin 의 `dram_zc` 등록은 L1 이 2 GiB 를 넘으면 실패한다. L1 사본을 `pwrite` 한 번으로 쓰는데 리눅스는 한 번에 2 GiB 조금 못 되게만 쓴다 | 코드(NIXL 1.5.1 · 10-30 main 의 `hf3fs_backend.cpp`) | `dram_zc` knob 에 shim(`tune/pwrite_full.c`, 끝까지 나눠 쓴다)을 `LD_PRELOAD` 로 건다. shim 이 없으면 그 knob 을 시작하지 않는다 |
+| `nixl_native` + `dram_zc` 는 worker 가 2개 이상이면 데이터가 조용히 망가진다. worker 마다 NIXL agent 가 같은 L1 을 따로 등록하고, 등록마다 L1 을 자기 `/dev/shm` 사본으로 바꿔 끼운다(`MAP_FIXED`). 마지막 사본만 L1 이 되고 나머지 worker 의 IO 는 LMCache 가 보지 않는 사본을 오간다. load 는 성공으로 나온다 | 측정(09-29, key 16개: worker 1 은 모두 같음, 2 는 8개 · 4 는 15개 다름) · 코드(LMCache `csrc/storage_backends/nixl/connector.cpp`) | `nixl_native` 의 `dram_zc` 는 worker 1개 knob(`w1-zc`)만 둔다. worker 2개 이상의 `dram_zc` · `auto` 는 `tune.py` 의 `native()` 가 막는다. 나머지 knob 은 `mem_config=dram` 을 적는다 |
+| 같은 까닭으로 `nixl_native` + `dram_zc` 는 `/dev/shm` 을 worker 수 x L1 만큼 쓴다. 모자라면 `No space left on device`(`hf3fs_backend.cpp:588`) | 측정(Spark: worker 16 · L1 32 GiB, `/dev/shm` 60 GiB) · 코드 | `dram_zc` knob 을 띄우기 전에 클라이언트마다 `/dev/shm` 여유를 보고, 모자라면 멈춘다 |
+| `nixl_native` 의 `mem_config` 기본값 `auto` 는 `dram_zc` 등록을 먼저 해 보고 실패하면 `dram` 으로 돈다. 등록이 되면(L1 2 GiB 이하이거나 shim 을 걸면) 위와 같이 망가진다 | 코드 · 측정(09-29, L1 2 GiB 이하) | 위와 같다 |
+| 빠른 결과가 망가진 데이터일 수 있다. replay 는 IO 양과 시간만 재고 내용은 보지 않는다. 망가진 `nixl_native` `dram_zc` 는 load 가 2.4배 빨라 보였다(2.9 → 6.8 GiB/s) | 측정(09-29) | 새 knob 이 크게 빠르면 데이터를 따로 확인하기 전에 채택하지 않는다 |
+| `nixl_store_dynamic` 의 `dram_zc` 는 L1 을 agent 하나로 한 번만 등록해 위 문제가 없다 | 코드(`dynamic_nixl_store_agent.py` `_init_mem_handlers`) | 그대로 knob 으로 둔다 |
+| NIXL 정렬이 key 크기를 나누지 못하면 adapter 가 뜨지 않는다(DeepSeek-V3 key 17,989,632 B 에 2 MiB · 8 MiB 정렬: `NIXL_ERR_NOT_FOUND`) | 측정 | DeepSeek-V3 은 4 KiB 정렬로 돈다 |
+| `hf3fs` adapter 의 key buffer(기본 켬)를 켜면 다른 노드가 나중에 쓴 key 를 못 찾는다 | 측정(10-12) | 늘 끈다. 문서 예시 knob(`doc`)도 이것만 끈다 |
+| `raw_hf3fs`(PR 5828, 머지 전)는 key → offset 표를 프로세스 메모리에만 둔다 | 코드 | 클라이언트 1대로만 돈다 |
+| `raw_hf3fs` 는 chunk 를 모든 chain 에 직접 놓는데, meta 는 파일을 지울 때 `min(dynamic stripe, stripe)` 개 chain 에서만 지운다 | 코드 · 측정(10-28) | 재생 폴더를 stripe = chain 수 · chunk 4 MiB 로 둔다(맞지 않으면 시작하지 않는다). meta `dynamic_stripe = false` 는 클러스터 쪽에서 맞춘다(도구는 보지 않는다) |
+| PR 5828 test 의 `cleanup_data_files()` 는 클러스터의 모든 파일 chunk 를 지운다 | 코드 | 부르지 않는다("하지 않는 것" 8) |
+| 3FS meta 의 GC 가 지운 파일의 회수를 멈춘다 | 측정(Spark 10-21 · 10-30) | 실행마다 3FS 여유 15% 를 본다. "문제가 생기면"의 `3FS 여유` 줄 |
+
 ## 문제가 생기면
 
 어느 경우든 코드를 고치거나, 옵션을 바꿔 우회하거나, 같은 명령을 세 번 넘게 다시 돌리지 않는다. 아래대로 하고 보고한다.
@@ -278,8 +298,9 @@ knob 하나하나의 결과는 `python3 tune/agent.py coverage --trace <trace> -
 | `설치 확인 실패` | adapter 가 덜 깔렸다 | 실패한 줄을 "설치"의 그 단계로 고치고 `agent.py install` 을 다시. 고칠 수 없으면 보고한다 |
 | `다른 작업이 보여 멈춘다` | 측정 중에 다른 사람의 작업이 보여 도구가 스스로 멈췄다 | 보고하고 기다린다. 사용자가 다시 하라고 하면 `agent.py next` |
 | `클러스터가 되돌릴 곳에 있지 않다` | 시작 때 클러스터 설정이 HOME 과 다르다 | 고치지 않는다. `python3 tune/settings.py state` 출력을 붙여 보고한다 |
-| `우리 목록 밖의 FUSE 클라이언트가 있다` | 클러스터 파일에 없는 FUSE 클라이언트가 붙어 있다 | 보고하고 기다린다 |
-| `3FS 여유 … < 15%` | 3FS 가 거의 찼다 | 지우지 않는다. 보고하고 기다린다 |
+| `우리 목록 밖의 FUSE 클라이언트가 있다` | 클러스터 파일에 없는 FUSE 클라이언트가 붙어 있다. FUSE 템플릿을 바꾸면 그쪽에도 걸린다 | 보고하고 기다린다. 클러스터 주인이 `[allow] other_fuse` 를 켜면 도구는 경고만 하고 잇는다 |
+| `/dev/shm 여유 … < dram_zc 에 필요한` | 그 클라이언트의 `/dev/shm` 에 L1 사본이 들어가지 않는다("알려진 문제") | 그 knob 은 이 클러스터에서 못 돈다. 보고한다 |
+| `3FS 여유 … < 15%` | 3FS 가 거의 찼다. 도구는 sweep 마다 데이터를 지우므로, 여유가 돌아오지 않으면 3FS GC 가 지운 파일을 회수하지 않는 것이다(3FS meta 의 결함으로 보인다, 확정 아님. 쓰기가 몰려 storage 가 GC 의 chunk 삭제를 `ResourceBusy` 로 거절하면, meta 가 그 실패를 처리하다 GC 작업을 잃거나 SEGV 로 죽는다. Spark 에서 10-21 · 10-30 두 번, adapter 와 상관없이 났고 기다려도 풀리지 않았다. 10-21 에는 meta 서비스만 다시 띄우자 회수가 다시 돌았다(storage 는 그대로) | 지우지 않는다. 보고하고 기다린다. meta 를 다시 띄우는 것은 클러스터 담당이 정한다 |
 | `pwrite_full.so 가 없다` 같은 `… 가 없다` | 빌드 · shim 이 그 노드에 없다 | "설치"의 그 단계를 그 노드에서 다시 하고 `agent.py install` |
 | `driver 가 실패했다`, `Traceback` | 실행이 에러로 끝났다 | `agent.py status` 의 로그 끝 20줄과 그 실행의 로그(`runs/<tag>-x<배속>.log`) 마지막 30줄을 붙여 보고한다 |
 | `!! 무효` | 실행이 무효다 | 측정은 그대로 둔다. 보고의 "무효" 줄에 적는다 |

@@ -9,7 +9,7 @@ replay 가 그 adapter 의 실제 IO 를 아직 내는지 chunk 대조로 확인
   tune.py table                          결과 표
 
 ADAPTER 는 nixl_store_dynamic · nixl_native · hf3fs · raw_hf3fs(PR 5828, 클라이언트 1대) — 종류마다 하나(ADAPTERS). 클러스터 설정 목록은 SETTINGS. 실행마다 다른 사람의 작업이 없는지 보고, 끝나면(어떻게 끝나든) FUSE · storage 를 되돌린다.
-클러스터 고유 값과 허락 범위는 clusters/<이름>.toml(cluster.py). 허락이 없는 쪽을 바꾸는 설정은 건너뛴다. 재시작이 필요한 설정은 SETTINGS 에 없다.
+클러스터 고유 값과 허락 범위는 clusters/<이름>.toml(cluster.py). 허락이 없는 쪽을 바꾸는 설정은 건너뛴다. FUSE 를 다시 띄워야 하는 설정(쓰기 admission 등)은 [allow] fuse_restart 일 때만 건다.
 시작 때 클러스터가 되돌릴 곳(템플릿 사본 · [home])에 있는지 보고, 아니면 멈춘다.
 replay 의 IO 는 LMCache 규칙(cache_sim.py 의 lmcache.rules)으로 만든 plan 을 쓴다.
 LMCache 는 [[client]] python 의 것을 쓴다 — RULES 의 commit(README "기준 버전") 하나에 adapter 셋이 다 있다.
@@ -68,6 +68,10 @@ def hf3fs_doc():
 
 
 def native(nw, mem="dram", dio="true"):
+    # dram_zc 는 NIXL agent(worker)마다 L1 을 등록하며 L1 자리를 자기 /dev/shm 사본으로 바꿔 끼운다 — worker 가 둘 이상이면 데이터가 조용히 망가진다
+    # (09-29 측정: key 16개 중 worker 2 는 8개 · 4 는 15개 다름). auto 도 등록이 되면(L1 2 GiB 이하 · shim) 같다 — RUNBOOK "알려진 문제"
+    if mem in ("dram_zc", "auto") and nw > 1:
+        raise ValueError(f"nixl_native mem_config={mem} 는 worker 1개로만 돈다(worker {nw})")
     return ('{"type":"nixl_native","backend":"HF3FS","backend_params":{"file_path":"{dir}","use_direct_io":"' + dio + '",'
             '"mount_point":"' + C.MOUNT + '","mem_config":"' + mem + '"},"num_workers":' + str(nw) + "}")
 
@@ -105,9 +109,8 @@ ADAPTERS = {
         "w4": dict(nd=1, aj=native(4)),
         "w16": dict(nd=1, aj=native(16)),
         "w16-a4k": dict(nd=1, aj=native(16), l1a=4096),   # L1 정렬 LMCache 기본(4 KiB)
-        # 10-22: nixl_store_dynamic 은 dram → dram_zc 가 0.07 → 0.20 이었다. native 는 dram 으로만 쟀다
-        "w16-zc": dict(nd=1, aj=native(16, "dram_zc"), prefix=f"LD_PRELOAD={PW_SHIM}"),
-        "w16-zc-a4k": dict(nd=1, aj=native(16, "dram_zc"), prefix=f"LD_PRELOAD={PW_SHIM}", l1a=4096),
+        # dram_zc 는 worker 1개로만(native() 의 막기). 09-29 에 데이터가 맞고 load 가 dram w4 보다 빨랐다. /dev/shm 에 L1 한 벌이 든다
+        "w1-zc": dict(nd=1, aj=native(1, "dram_zc"), prefix=f"LD_PRELOAD={PW_SHIM}"),
         "w16-nodio": dict(nd=1, aj=native(16, dio="false"))}),   # O_DIRECT 끔
     "hf3fs": dict(rules=RULES, verify=True, knobs={
         "w4-d1": dict(nd=1, aj=hf3fs(1, False)),
@@ -136,15 +139,18 @@ ADAPTERS = {
 }
 for k in ADAPTERS["raw_hf3fs"]["knobs"].values():
     k["prefix"] = f"LMCACHE_3FS_IB_DEVICES={RAW['ib_devices']}" if RAW["ib_devices"] else ""   # FUSE 와 같은 RDMA 장치(로컬 패치)
-# 클러스터 설정 (기준에서 하나씩). chunk 는 재생 폴더의 3FS layout
+# 클러스터 설정 (기준에서 하나씩). chunk · stripe 는 재생 폴더의 3FS layout(LAYOUT_KEYS) — 나머지는 settings.apply 가 건다
+LAYOUT_KEYS = ("chunk", "stripe")
 SETTINGS = {
     # base = 실험 기준 settings.REF(clusters/<이름>.toml [ref], 측정으로 고른 값, 템플릿과 따로 — 읽기 12/3 · 4MB 는 09-14-15 의 최적화). src = 3FS 소스 기본값(읽기 32/8 · 4MB) — 보고의 출발점(HANDOFF 기준선)
     "base": {}, "src": dict(read="32/8"), "b1m": dict(batch="1MB"), "r32-1m": dict(read="32/8", batch="1MB"),
     "r6": dict(read="6/2"), "rts": dict(rdma="true", rts="on"), "c512k": dict(read="32/8", batch="512KB", chunk=524288),
     "c4m": dict(chunk=4194304),
     "ch512k": dict(chunk=524288),          # chunk 만. c512k 는 읽기 32/8 · 묶음 512KB 도 함께 바꿔 chunk 효과로 못 읽는다
-    "w32": dict(write="32/8"),             # FUSE 쓰기 admission 소스 기본값 — FUSE 재시작 뒤 FUSE_WRITE=32/8 로만 돈다
-    "src-w32": dict(read="32/8", write="32/8"),   # 읽기 · 쓰기 모두 소스 기본값 = 참 기준선(문서 예시 adapter 와 함께). FUSE_WRITE=32/8 로만 돈다
+    "w32": dict(write="32/8"),             # FUSE 쓰기 admission 소스 기본값 — CONFIG_ITEM 이라 [allow] fuse_restart 일 때만(도구가 FUSE 를 다시 띄운다)
+    "src-w32": dict(read="32/8", write="32/8"),   # 읽기 · 쓰기 모두 소스 기본값 = baseline(문서 예시 knob 과 함께, agent 6 단계). fuse_restart 일 때만
+    "conn2": dict(conn="2"), "conn4": dict(conn="4"),   # storage 연결 수(transport_pool max_connections, hot update 로 걸린다)
+    "stripe4": dict(stripe=4), "stripe1": dict(stripe=1), "stripe1-b1m": dict(stripe=1, batch="1MB"),   # 재생 폴더 layout 의 stripe(파일 하나가 퍼지는 chain 수)
 }
 
 
@@ -185,21 +191,34 @@ def shim_ok(prefix, _seen={}):
                 raise SystemExit(f"{f} 가 없다: {', '.join(_seen[f])} — 그 파일을 두거나 clusters/<이름>.toml [builds] pwrite_shim 을 고친다")
 
 
+def shm_ok(c, _seen={}):
+    """dram_zc 는 등록마다 L1 크기의 /dev/shm 사본을 만든다(NIXL HF3FS) — nixl_native 는 worker 마다, nixl_store_dynamic 은 한 번.
+    클라이언트마다 /dev/shm 여유가 그보다 적으면 실행 전에 멈춘다(그대로 띄우면 No space left on device)"""
+    if "mem_config=dram_zc" not in c.get("bp", []) and '"mem_config":"dram_zc"' not in c.get("aj", ""):
+        return
+    need = int(MEM.split("-")[1][1:]) * (json.loads(c["aj"]).get("num_workers", 1) if c.get("aj") else 1) * 2**30
+    if not _seen:
+        _seen.update({cl["host"]: int(C.sh(C.addr(cl["host"]), "df -B1 --output=avail /dev/shm | tail -1").strip()) for cl in C.CLIENTS})
+    low = {h: f"{a / 2**30:.0f}" for h, a in _seen.items() if a < need}
+    if low:
+        raise SystemExit(f"/dev/shm 여유 GiB {low} < dram_zc 에 필요한 {need / 2**30:.0f} GiB(L1 x 등록 수) — 이 knob 은 이 클러스터에서 못 돈다")
+
+
 def on_grid(x):
     """GRID 에서 x 에 가장 가까운 배속"""
     return min(GRID, key=lambda g: abs(math.log(g / x)))
 
 
-def data_dir(adapter, knob, chunk, wm=""):
-    """adapter · knob · chunk 크기(· trace · 모델)마다 폴더 하나. 미리 쓴 chunk 를 배속 · 클러스터 설정이 바뀌어도 다시 쓴다(--keep-prepop)."""
+def data_dir(adapter, knob, chunk, wm="", stripe=None):
+    """adapter · knob · layout(chunk · stripe)(· trace · 모델)마다 폴더 하나. 미리 쓴 chunk 를 배속 · 클러스터 설정이 바뀌어도 다시 쓴다(--keep-prepop)."""
     nd = ADAPTERS[adapter]["knobs"][knob]["nd"]
-    d = f"{DATA}/{adapter}{wm}-{knob}" + ("" if chunk is None else f"-c{chunk >> 10}k")
+    d = f"{DATA}/{adapter}{wm}-{knob}" + ("" if chunk is None else f"-c{chunk >> 10}k") + ("" if stripe is None else f"-s{stripe}")
     for x in [d] + ([f"{d}/p{i}" for i in range(nd)] if nd > 1 else []):
-        if chunk is None:
+        if chunk is None and stripe is None:
             os.makedirs(x, exist_ok=True)
             os.chmod(x, 0o777)
         else:
-            ensure_layout(x, STRIPE, chunk)        # 하위 폴더에도 layout 을 직접 건다
+            ensure_layout(x, stripe or STRIPE, chunk or CHUNK)        # 하위 폴더에도 layout 을 직접 건다
     lay = {l.split()[0]: l.split()[-1] for l in admin(f"stat --display-layout {C.rel(d)}").splitlines()
            if l.startswith("Layout-")}
     if lay.get("Layout-ChunkSize") != str(chunk or CHUNK):
@@ -231,10 +250,22 @@ class Sweep:
         S.log(f"plan {self.fam.name}: store÷load {b['store_chunks'] / max(1, b['load_chunks']):.2f}"
               " — 1 을 넘으면 store 벽에 먼저 걸리기 쉬워 store 쪽 설정부터 본다(10-24 coder 60분)")
 
+    def fingerprint(self, c, d):
+        """그 실행을 정하는 것 — knob 정의 · 걸린 클러스터 설정 값 · 재생 폴더(layout 이 이름에 있다) · 빌드 · plan"""
+        return json.loads(json.dumps({"knob": c, "settings": S.CUR, "data": Path(d).name, "build": build(self.adapter), "plan": self.fam.name},
+                                     sort_keys=True))
+
     def run(self, tag, c, d, speed):
         out = self.out / "runs" / f"{tag}-x{speed:g}"
+        fp, fpf = self.fingerprint(c, d), out / "fingerprint.json"
         if (out / "summary.json").exists():
-            return out
+            if not fpf.exists() or json.loads(fpf.read_text()) == fp:     # 지문이 없는 옛 실행(10-31 전)은 지금 정의로 잰 것으로 본다
+                return out
+            old = out.with_name(f"{out.name}.old-{time.strftime('%m%d%H%M')}")
+            S.log(f"  {out.name}: knob · 설정이 그 실행 때와 달라 다시 잰다(옛 실행은 {old.name})")
+            out.rename(old)
+            if Path(f"{out}.log").exists():
+                Path(f"{out}.log").rename(f"{old}.log")
         dl = Path(__file__).with_name("deadline")      # 있으면(epoch 초) 그 전에 끝나지 않을 실행은 시작하지 않는다
         if dl.exists() and time.time() + 8 * 60 > float(dl.read_text()):
             raise SystemExit(f"마감 {time.strftime('%m-%d %H:%M', time.localtime(float(dl.read_text())))} — 실행을 더 시작하지 않는다")
@@ -243,10 +274,11 @@ class Sweep:
             raise SystemExit("다른 작업이 보여 멈춘다: " + "; ".join(why))
         fs = os.statvfs(C.MOUNT)                       # 10-21: 지운 파일이 회수되지 않아 3FS 가 98% 찼다
         if fs.f_bavail / fs.f_blocks < MIN_FREE:
-            raise SystemExit(f"3FS 여유 {fs.f_bavail / fs.f_blocks:.1%} < {MIN_FREE:.0%} — GC 가 회수하는지 먼저 본다 (gcwatch.sh)")
+            raise SystemExit(f"3FS 여유 {fs.f_bavail / fs.f_blocks:.1%} < {MIN_FREE:.0%} — 3FS GC 가 지운 파일을 회수하지 않을 수 있다 (RUNBOOK 의 문제가 생기면)")
         py, pypath = build(self.adapter)
         prefix = " ".join(x for x in (c.get("prefix", ""), pypath) if x)
         shim_ok(prefix)
+        shm_ok(c)
         plan = F.speed_plan(self.fam, "full", speed)
         cmd = (f"cd {SM} && exec python3 replay.py {plan} --out {out} --procs 1 --slots {c.get('slots', 8)} --data-dir {d} --keep-prepop"
                + (f" --adapter-json '{c['aj']}'" if c.get("aj") else "")
@@ -256,6 +288,7 @@ class Sweep:
                + "".join(f" --backend-param {kv}" for kv in c.get("bp", [])))
         with open(f"{out}.log", "w") as lf:
             subprocess.run(["bash", "-c", cmd], stdout=lf, stderr=subprocess.STDOUT, check=True)
+        fpf.write_text(json.dumps(fp, ensure_ascii=False, indent=1))
         if json.loads((out / "summary.json").read_text()).get("storage_restart"):
             S.log("  !! 실행 중 storage 가 다시 떴다 — 이 실행은 무효. hot-update 가 풀렸을 수 있어 지금 설정을 다시 건다")
             S.apply(dict(S.CUR), force=True)
@@ -303,11 +336,11 @@ class Sweep:
         """클러스터 설정마다 걸고 (이름, 설정)을 낸다 — 걸 수 없는 것은 건너뛴다"""
         for name in settings:
             f = SETTINGS[name]
-            if self.v.get("layout") and f.get("chunk"):
-                S.log(f"   {name}: {self.adapter} 는 재생 폴더 chunk 가 {self.v['layout']} 로 정해져 있어 건너뛴다")
+            if self.v.get("layout") and any(f.get(k) for k in LAYOUT_KEYS):
+                S.log(f"   {name}: {self.adapter} 는 재생 폴더 layout 이 정해져 있어(chunk {self.v['layout']} · stripe = chain 수) 건너뛴다")
                 continue
             try:
-                S.apply({**S.BASE, **{k: v for k, v in f.items() if k != "chunk"}})
+                S.apply({**S.BASE, **{k: v for k, v in f.items() if k not in LAYOUT_KEYS}})
             except S.NotAllowed as e:
                 S.log(f"   {name}: {e} 을 바꿀 허락이 없어 건너뛴다")
                 continue
@@ -317,7 +350,7 @@ class Sweep:
         """search 대신 그 배속만 다시 잰다(tag 끝 .r2 · .r3 …) — 한 칸 차이를 세 번 중 두 번으로 정할 때"""
         for name, f in self.each_setting(settings):
             for k in knobs:
-                d = data_dir(self.adapter, k, f.get("chunk") or self.v.get("layout"), self.wm)
+                d = data_dir(self.adapter, k, f.get("chunk") or self.v.get("layout"), self.wm, f.get("stripe"))
                 oks = [self.measure(f"{k}+{name}.r{i}", self.v["knobs"][k], d, speed)["ok"] for i in range(first, first + times)]
                 S.log(f"   {k}+{name} x{speed:g} 다시 {times}번: 통과 {sum(oks)}")
 
@@ -325,12 +358,12 @@ class Sweep:
         """search 대신 그 배속에서 한 번씩 — 후보 거르기. tag 가 search 와 같아 뒤의 search 가 이 실행을 그대로 쓴다"""
         for name, f in self.each_setting(settings):
             for k in knobs:
-                self.measure(f"{k}+{name}", self.v["knobs"][k], data_dir(self.adapter, k, f.get("chunk") or self.v.get("layout"), self.wm), speed)
+                self.measure(f"{k}+{name}", self.v["knobs"][k], data_dir(self.adapter, k, f.get("chunk") or self.v.get("layout"), self.wm, f.get("stripe")), speed)
 
-    def go(self, knobs, settings, start, set_start=None):
-        best_knob, best_sp = None, None
+    def go(self, knobs, settings, start, set_start=None, settings_only=False):
+        best_knob, best_sp = (knobs[0], start) if settings_only else (None, None)   # settings_only: ① 을 건너뛰고 첫 knob 으로 ② 만
         S.apply({**S.BASE})
-        for k in knobs:                                          # ① 클러스터 기본값에서 adapter 설정마다
+        for k in [] if settings_only else knobs:                 # ① 클러스터 기본값에서 adapter 설정마다
             sp = self.search(f"{k}+base", self.v["knobs"][k], data_dir(self.adapter, k, self.v.get("layout"), self.wm), start)
             if sp and (best_sp is None or sp > best_sp):
                 best_knob, best_sp = k, sp
@@ -342,15 +375,16 @@ class Sweep:
             if name == "base":
                 continue
             f = SETTINGS[name]
-            if self.v.get("layout") and f.get("chunk"):
-                S.log(f"   {name}: {self.adapter} 는 재생 폴더 chunk 가 {self.v['layout']} 로 정해져 있어 건너뛴다")
+            if self.v.get("layout") and any(f.get(k) for k in LAYOUT_KEYS):
+                S.log(f"   {name}: {self.adapter} 는 재생 폴더 layout 이 정해져 있어(chunk {self.v['layout']} · stripe = chain 수) 건너뛴다")
                 continue
             try:
-                S.apply({**S.BASE, **{k: v for k, v in f.items() if k != "chunk"}})
+                S.apply({**S.BASE, **{k: v for k, v in f.items() if k not in LAYOUT_KEYS}})
             except S.NotAllowed as e:
                 S.log(f"   {name}: {e} 을 바꿀 허락이 없어 건너뛴다")
                 continue
-            self.search(f"{best_knob}+{name}", self.v["knobs"][best_knob], data_dir(self.adapter, best_knob, f.get("chunk") or self.v.get("layout"), self.wm), set_start or best_sp)
+            self.search(f"{best_knob}+{name}", self.v["knobs"][best_knob],
+                        data_dir(self.adapter, best_knob, f.get("chunk") or self.v.get("layout"), self.wm, f.get("stripe")), set_start or best_sp)
 
 
 # --- verify ---
@@ -450,6 +484,7 @@ def main():
     ap.add_argument("--screen", action="store_true", help="search 대신 --start 배속에서 knob x 클러스터 설정마다 한 번씩(후보 거르기)")
     ap.add_argument("--rep-start", type=int, default=2, help="--repeat 의 tag 첫 번호(.rN) — 앞서 쓴 번호와 겹치지 않게")
     ap.add_argument("--set-start", type=float, help="클러스터 설정 search 의 첫 배속(기본: adapter 설정의 최대 배속)")
+    ap.add_argument("--settings-only", action="store_true", help="base 에서의 knob search 를 건너뛰고 첫 knob x --settings 만 --start 에서 search(baseline)")
     ap.add_argument("--evict", help="L1 비우기 문턱/비율(LMCache 기본 0.8/0.2). plan 을 시뮬레이터로 다시 낸다(IO 양이 바뀐다)")
     ap.add_argument("--clients", type=int, help="클라이언트 수(기본: 그 adapter 가 정한 수, 없으면 [[client]] 전부). 같은 trace 구간을 그 대수가 나눠 받는다")
     args = ap.parse_args()
@@ -473,7 +508,7 @@ def main():
         elif args.repeat:
             sw.repeat(knobs, start, args.repeat, args.rep_start, args.settings.split(",") if args.settings != ap.get_default("settings") else ("base",))
         else:
-            sw.go(knobs, args.settings.split(","), start, args.set_start and on_grid(args.set_start))
+            sw.go(knobs, args.settings.split(","), start, args.set_start and on_grid(args.set_start), args.settings_only)
     finally:
         S.restore()
         shutil.rmtree(DATA, ignore_errors=True)
